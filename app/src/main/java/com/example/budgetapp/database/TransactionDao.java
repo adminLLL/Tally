@@ -129,6 +129,25 @@ public interface TransactionDao {
     List<Transaction> getUnsettledTransactionsByRuleSync(int ruleId);
 
     /**
+     * 【幂等激活】把一条“未生效”的账单抢占式标记为已生效，返回 1 表示本次抢到、0 表示别人已经处理过。
+     *
+     * <p>周期账单激活有两个入口：{@code MainActivity.onResume}（用户回到前台）和
+     * {@code RecurringTransactionWorker}（每小时）。改造前两边都是“先查后写”，
+     * 同一条 isSettled=0 的记录会被并发处理两次，资产余额因此被重复加减。
+     *
+     * <p>这里用一条带条件的 UPDATE 完成“查询 + 标记”，SQLite 的单条语句是原子的，
+     * 只有 affected rows = 1 的那一次才允许继续改余额。
+     */
+    @Query("UPDATE transactions SET isSettled = 1 WHERE id = :id AND isSettled = 0")
+    int markSettledIfPending(int id);
+
+    /**
+     * 【幂等激活】去掉“生效时间 ”前缀后写回备注。
+     */
+    @Query("UPDATE transactions SET note = :note WHERE id = :id")
+    void updateNote(int id, String note);
+
+    /**
      * 批量删除指定规则的所有未生效账单
      */
     @Query("DELETE FROM transactions WHERE recurringRuleId = :ruleId AND isSettled = 0")

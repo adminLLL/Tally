@@ -49,6 +49,19 @@ public class Transaction {
     @androidx.room.ColumnInfo(defaultValue = "0")
     public long scheduledExecuteTime = 0L;
 
+    /**
+     * 【余额一致性】这条流水写入时是否真的改过资产余额。
+     *
+     * <p>历史包袱：全app有两条写账路径——{@code addTransactionWithAssetSync}（记账同时改余额）
+     * 和 {@code addTransaction}（只写流水，例如批量导入）。删单时如果无条件回补余额，
+     * 会把“从没扣过钱”的记录也补一次，反而把余额算多。
+     *
+     * <p>所以这里按行打标：只有标记为 1 的记录，{@code deleteTransaction} 才做余额回补。
+     * 升级前的老数据一律为 0（保持改造前“删单不动余额”的行为，不引入新的偏差）。
+     */
+    @androidx.room.ColumnInfo(defaultValue = "0")
+    public int assetSynced = 0;
+
     public Transaction() {
     }
 

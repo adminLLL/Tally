@@ -17,8 +17,13 @@ import rikka.shizuku.Shizuku;
 
 public class ShizukuManager {
 
-    private static final String ACCESSIBILITY_SERVICE_COMPONENT =
-            "com.example.budgetapp/com.google.android.accessibility.selecttospeak.SelectToSpeakService";
+    private static final String ACCESSIBILITY_SERVICE_CLASS =
+            "com.google.android.accessibility.selecttospeak.SelectToSpeakService";
+
+    /** 无障碍服务组件全名，运行期按当前包名拼装（debug 变体包名带 .debug 后缀）。 */
+    private static String accessibilityServiceComponent(Context context) {
+        return context.getPackageName() + "/" + ACCESSIBILITY_SERVICE_CLASS;
+    }
 
     // 记录 Binder 是否已连接
     private static boolean isBinderReady = false;
@@ -101,7 +106,7 @@ public class ShizukuManager {
         if (enabledServices != null) {
             for (AccessibilityServiceInfo service : enabledServices) {
                 if (service.getId().contains("SelectToSpeakService") ||
-                        service.getId().contains("com.example.budgetapp")) {
+                        service.getId().startsWith(context.getPackageName())) {
                     return true;
                 }
             }
@@ -119,7 +124,7 @@ public class ShizukuManager {
             serviceSet.addAll(Arrays.asList(split));
         }
 
-        serviceSet.add(ACCESSIBILITY_SERVICE_COMPONENT);
+        serviceSet.add(accessibilityServiceComponent(context));
         String updatedServices = String.join(":", serviceSet);
 
         execCommand("settings put secure enabled_accessibility_services " + updatedServices);

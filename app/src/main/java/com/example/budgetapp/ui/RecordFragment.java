@@ -647,7 +647,9 @@ public class RecordFragment extends Fragment {
         if (transactions == null || getContext() == null) return;
 
         SharedPreferences prefs = requireContext().getSharedPreferences("app_prefs", Context.MODE_PRIVATE);
-        boolean isBudgetEnabled = prefs.getBoolean("budget_enabled", false);
+        // 原来读 "budget_enabled"，但设置页/BudgetManagementActivity 写的是 "is_budget_enabled"，
+        // 导致这个判断恒为 false、账单卡片永远不会因为“预算已开启”而隐藏。统一到真实 key。
+        boolean isBudgetEnabled = prefs.getBoolean("is_budget_enabled", false);
         boolean isBillCardReplace = prefs.getBoolean("bill_card_replace_budget", false);
         boolean isBillCardEnabled = prefs.getBoolean("bill_card", false);
 
@@ -2045,6 +2047,10 @@ public class RecordFragment extends Fragment {
 
                     // 【新增】保存不计入预算的状态
                     t.excludeFromBudget = isExcludedFromBudget[0];
+
+                    // 【余额一致性】这条走的是“记账 + 同步资产余额”路径，标记为已同步，
+                    // 删除时才会按 LedgerMath 回补（批量导入等只写流水的记录保持 0）。
+                    t.assetSynced = 1;
 
                     // 使用事务保证账单和多资产同步更新
                     final int finalAssetId = selectedAssetId;

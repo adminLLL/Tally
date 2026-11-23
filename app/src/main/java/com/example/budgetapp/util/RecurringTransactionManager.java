@@ -6,6 +6,7 @@ import com.example.budgetapp.database.AppDatabase;
 import com.example.budgetapp.database.AssetAccount;
 import com.example.budgetapp.database.RecurringRule;
 import com.example.budgetapp.database.Transaction;
+import com.example.budgetapp.database.TransactionDao;
 
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
@@ -173,52 +174,67 @@ public class RecurringTransactionManager {
     }
 
     /**
-     * 激活所有已到期的待生效账单
+     * 激活所有已到期的待生效账单。
+     *
+     * <p>【并发安全】这个方法的调用方有两个：{@code MainActivity.onResume}（用户回到前台）
+     * 和 {@code RecurringTransactionWorker}（每小时后台任务）。改造前两边都是“先查后写”，
+     * 同一条 {@code isSettled = 0} 的账单会被处理两次，资产余额被重复加减。
+     *
+     * <p>现在每条账单先用 {@link TransactionDao#markSettledIfPending(int)} 做抢占式标记：
+     * 只有 affected rows = 1 的那一次才继续改余额，另一个入口拿到 0 直接跳过。
+     * 标记与余额变更放在同一个事务里，失败会整体回滚。
+     *
+     * @return 本次真正激活的账单条数
      */
     public static int activatePendingTransactions(Context context) {
         AppDatabase db = AppDatabase.getDatabase(context);
         long currentTime = System.currentTimeMillis();
-        
+
         List<Transaction> pendingTransactions = db.transactionDao().getPendingActivationTransactionsSync(currentTime);
         int activatedCount = 0;
-        
+
         for (Transaction transaction : pendingTransactions) {
-            // 标记为已生效
-            transaction.isSettled = true;
-            
             // 【修改】删除备注中的"生效时间"四个字,保留时间格式 "MM-dd HH:mm"
-            if (transaction.note != null && transaction.note.startsWith("生效时间 ")) {
-                // 删除前缀"生效时间 ",保留后面的时间
-                transaction.note = transaction.note.substring("生效时间 ".length());
+            final String trimmedNote =
+                    (transaction.note != null && transaction.note.startsWith("生效时间 "))
+                            ? transaction.note.substring("生效时间 ".length())
+                            : transaction.note;
+
+            final boolean[] claimed = {false};
+            db.runInTransaction(() -> {
+                // 【幂等】抢占：只有把 isSettled 从 0 改成 1 成功的那一次才允许动余额
+                if (db.transactionDao().markSettledIfPending(transaction.id) != 1) {
+                    return;
+                }
+                if (trimmedNote != null && !trimmedNote.equals(transaction.note)) {
+                    db.transactionDao().updateNote(transaction.id, trimmedNote);
+                }
+                transaction.isSettled = true;
+                transaction.note = trimmedNote;
+                updateAssetBalance(db, transaction);
+                claimed[0] = true;
+            });
+
+            if (claimed[0]) {
+                activatedCount++;
             }
-            
-            db.transactionDao().update(transaction);
-            
-            // 更新资产账户余额
-            updateAssetBalance(context, transaction);
-            
-            activatedCount++;
         }
-        
+
         return activatedCount;
     }
 
     /**
-     * 更新资产账户余额
+     * 更新资产账户余额（周期账单激活时）。
+     *
+     * <p>只处理直接指定了资产的支出/收入；负债/借出对象的联动仍走记账入口，
+     * 周期账单暂不覆盖（改动会牵动对手方匹配规则，留给后续批次）。
      */
-    private static void updateAssetBalance(Context context, Transaction transaction) {
-        AppDatabase db = AppDatabase.getDatabase(context);
-        
-        if (transaction.assetId > 0) {
+    private static void updateAssetBalance(AppDatabase db, Transaction transaction) {
+        if (transaction.assetId > 0 && (transaction.type == 0 || transaction.type == 1)) {
             AssetAccount asset = db.assetAccountDao().getAssetByIdSync(transaction.assetId);
             if (asset != null) {
-                if (transaction.type == 0) {
-                    // 支出：扣除余额
-                    asset.amount -= transaction.amount;
-                } else if (transaction.type == 1) {
-                    // 收入：增加余额
-                    asset.amount += transaction.amount;
-                }
+                asset.amount += com.example.budgetapp.domain.LedgerMath
+                        .ownAssetDelta(asset.type, transaction.type, transaction.amount);
                 asset.updateTime = System.currentTimeMillis();
                 db.assetAccountDao().update(asset);
             }

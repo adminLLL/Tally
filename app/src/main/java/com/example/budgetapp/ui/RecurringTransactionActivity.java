@@ -841,7 +841,9 @@ public class RecurringTransactionActivity extends AppCompatActivity {
 
     private String getDefaultCurrency() {
         SharedPreferences prefs = getSharedPreferences("app_prefs", MODE_PRIVATE);
-        return prefs.getString("default_currency", "¥");
+        // 原来读的是 "default_currency"，但设置页只写 "default_currency_symbol"，
+        // 这个 key 从来没被写入过 → 周期记账永远显示 ¥。改用真实存在的 key。
+        return prefs.getString("default_currency_symbol", "¥");
     }
 
     private String getCurrencyName(String symbol) {

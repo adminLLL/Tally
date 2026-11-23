@@ -1,6 +1,7 @@
 package com.example.budgetapp;
 
 import com.example.budgetapp.database.AssetAccount;
+import com.example.budgetapp.database.ExpensePlan;
 import com.example.budgetapp.database.Goal;
 import com.example.budgetapp.database.Transaction;
 import com.example.budgetapp.database.RenewalItem;
@@ -20,6 +21,9 @@ public class BackupData {
     public Map<String, List<String>> subCategoryMap;
     public List<Goal> goals;
     public List<RecurringRule> recurringRules; // 【新增】周期记账规则
+
+    // 【新增】月度支出计划；老备份没有该字段，反序列化后为 null，按空处理即可
+    public List<ExpensePlan> expensePlans;
 
     public AssistantConfigData assistantConfig;
     public List<String> autoAssetRules;

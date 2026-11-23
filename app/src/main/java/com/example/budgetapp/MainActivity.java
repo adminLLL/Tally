@@ -33,6 +33,7 @@ import androidx.navigation.fragment.NavHostFragment;
 import androidx.navigation.ui.NavigationUI;
 
 import com.example.budgetapp.database.AssetAccount;
+import com.example.budgetapp.database.AppDatabase;
 import com.example.budgetapp.database.Transaction;
 import com.example.budgetapp.widget.TodaySummaryWidget;
 import com.google.android.accessibility.selecttospeak.SelectToSpeakService;
@@ -215,6 +216,9 @@ public class MainActivity extends AppCompatActivity {
                 case 4: // 统计
                     targetNavId = R.id.nav_stats;
                     break;
+                case 5: // 计划
+                    targetNavId = R.id.nav_plan;
+                    break;
             }
             
             // 如果不是默认的记账页面，则跳转到指定页面
@@ -260,7 +264,13 @@ public class MainActivity extends AppCompatActivity {
                     assetsTab.setOnLongClickListener(v -> true);
                 }
 
-                // 4. 明细: 屏蔽默认长按提示
+                // 4. 计划: 屏蔽默认长按提示
+                View planTab = bottomNav.findViewById(R.id.nav_plan);
+                if (planTab != null) {
+                    planTab.setOnLongClickListener(v -> true);
+                }
+
+                // 5. 明细: 屏蔽默认长按提示
                 View detailsTab = bottomNav.findViewById(R.id.nav_details);
                 if (detailsTab != null) {
                     detailsTab.setOnLongClickListener(v -> true);
@@ -275,7 +285,8 @@ public class MainActivity extends AppCompatActivity {
                         int currentId = navController.getCurrentDestination().getId();
                         // 新增 R.id.nav_details
                         if (currentId == R.id.nav_record || currentId == R.id.nav_assets ||
-                                currentId == R.id.nav_stats || currentId == R.id.nav_details) {
+                                currentId == R.id.nav_stats || currentId == R.id.nav_details ||
+                                currentId == R.id.nav_plan) {
                             finish();
                         } else {
                             if (!navController.popBackStack()) {
@@ -491,13 +502,15 @@ public class MainActivity extends AppCompatActivity {
         applyCustomBackground();
 
         // 【周期记账】检查并激活到期的周期账单
-        new Thread(() -> {
+        // 用统一的数据库线程池而不是裸 new Thread：激活内部要开事务、读写 Room，
+        // 走 AppDatabase.databaseWriteExecutor 才能和其他写操作串在同一个池里，避免无限制新建线程。
+        AppDatabase.databaseWriteExecutor.execute(() -> {
             try {
-                com.example.budgetapp.util.RecurringTransactionManager.activatePendingTransactions(this);
+                com.example.budgetapp.util.RecurringTransactionManager.activatePendingTransactions(getApplicationContext());
             } catch (Exception e) {
                 e.printStackTrace();
             }
-        }).start();
+        });
 
         // 动态控制"预算"菜单栏是否显示
         BottomNavigationView bottomNav = findViewById(R.id.bottom_nav);
