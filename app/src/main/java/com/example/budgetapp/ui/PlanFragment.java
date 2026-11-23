@@ -225,11 +225,7 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
 
     @Override
     public void onToggleComplete(ExpensePlan plan) {
-        if (plan.completed) {
-            // 已完成的项目再点 √ 不再打开选择窗口，重置统一走详情页的「重置」按钮
-            toast("已完成，如需重置请在详情中操作");
-            return;
-        }
+        // 已完成也打开选择窗口（预勾选上次关联的流水），可以增删后再保存
         showCompleteDialog(plan);
     }
 
@@ -499,6 +495,15 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
         TextView tvTotal = view.findViewById(R.id.tv_complete_total);
         TextView tvEmpty = view.findViewById(R.id.tv_complete_empty);
         Button btnConfirm = view.findViewById(R.id.btn_confirm_complete);
+        TextView tvTitle = view.findViewById(R.id.tv_complete_title);
+        TextView tvHint = view.findViewById(R.id.tv_complete_hint);
+
+        final boolean editingCompleted = plan.completed;
+        if (editingCompleted) {
+            tvTitle.setText("调整关联流水");
+            tvHint.setText("已勾选上次关联的流水，可增加或取消，保存后重新合计");
+            btnConfirm.setText("保 存");
+        }
 
         List<Long> selectedIds = new ArrayList<>();
         double[] selectedTotal = {0d};
@@ -512,6 +517,8 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
                 return;
             }
             SimpleDateFormat dateFormat = new SimpleDateFormat("MM-dd", Locale.CHINA);
+            List<Long> linkedIds = PlanViewModel.parseIds(plan.linkedTransactionIds);
+            int matchedLinkedCount = 0;
             for (Transaction transaction : transactions) {
                 CheckBox checkBox = new CheckBox(requireContext());
                 checkBox.setTextSize(13f);
@@ -531,6 +538,13 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
                 checkBox.setPadding(dp(4), dp(6), dp(4), dp(6));
                 final long transactionId = transaction.id;
                 final double amount = transaction.amount;
+                // 先勾选再挂监听，避免 setChecked 触发回调重复累加
+                if (linkedIds.contains(transactionId)) {
+                    checkBox.setChecked(true);
+                    selectedIds.add(transactionId);
+                    selectedTotal[0] += amount;
+                    matchedLinkedCount++;
+                }
                 checkBox.setOnCheckedChangeListener((buttonView, isChecked) -> {
                     if (isChecked) {
                         selectedIds.add(transactionId);
@@ -544,6 +558,12 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
                 });
                 container.addView(checkBox);
             }
+            btnConfirm.setEnabled(!selectedIds.isEmpty());
+            tvTotal.setText("已选 " + selectedIds.size() + " 笔 · " + money(selectedTotal[0]));
+            if (editingCompleted && matchedLinkedCount < linkedIds.size()) {
+                tvHint.setText("部分原关联流水已不存在，保存后将按当前勾选重新合计");
+            }
+
             ViewGroup.LayoutParams lp = scrollView.getLayoutParams();
             lp.height = transactions.size() > 4 ? dp(260) : ViewGroup.LayoutParams.WRAP_CONTENT;
             scrollView.setLayoutParams(lp);
@@ -553,7 +573,7 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
         btnConfirm.setOnClickListener(v -> {
             if (selectedIds.isEmpty()) return;
             viewModel.completePlan(plan.id, new ArrayList<>(selectedIds), selectedTotal[0]);
-            toast("已标记完成");
+            toast(editingCompleted ? "已更新关联流水" : "已标记完成");
             dialog.dismiss();
         });
 
