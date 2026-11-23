@@ -71,6 +71,7 @@
                 android:layout_height="36dp"
                 android:background="?attr/selectableItemBackgroundBorderless"
                 android:src="@drawable/ic_arrow_left"
+                app:tint="@color/black"
                 android:contentDescription="上一个月" />
 
             <TextView
@@ -90,6 +91,7 @@
                 android:layout_height="36dp"
                 android:background="?attr/selectableItemBackgroundBorderless"
                 android:src="@drawable/ic_arrow_right"
+                app:tint="@color/black"
                 android:contentDescription="下一个月" />
         </LinearLayout>
 
@@ -114,6 +116,7 @@
                 android:layout_height="36dp"
                 android:background="?attr/selectableItemBackgroundBorderless"
                 android:src="@drawable/ic_arrow_left"
+                app:tint="@color/black"
                 android:contentDescription="提高优先度" />
 
             <TextView
@@ -133,6 +136,7 @@
                 android:layout_height="36dp"
                 android:background="?attr/selectableItemBackgroundBorderless"
                 android:src="@drawable/ic_arrow_right"
+                app:tint="@color/black"
                 android:contentDescription="降低优先度" />
         </LinearLayout>
 

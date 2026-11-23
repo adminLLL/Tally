@@ -36,7 +36,8 @@
                 android:layout_height="40dp"
                 android:background="?attr/selectableItemBackgroundBorderless"
                 android:contentDescription="上一年"
-                android:src="@drawable/ic_arrow_left" />
+                android:src="@drawable/ic_arrow_left"
+                app:tint="@color/black" />
 
             <TextView
                 android:id="@+id/tv_picker_year"
@@ -55,7 +56,8 @@
                 android:layout_height="40dp"
                 android:background="?attr/selectableItemBackgroundBorderless"
                 android:contentDescription="下一年"
-                android:src="@drawable/ic_arrow_right" />
+                android:src="@drawable/ic_arrow_right"
+                app:tint="@color/black" />
         </LinearLayout>
 
         <!-- 12 个月，3 行 × 4 列 -->
