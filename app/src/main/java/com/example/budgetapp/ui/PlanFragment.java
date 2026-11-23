@@ -6,7 +6,9 @@ import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
 import android.os.Bundle;
+import android.view.GestureDetector;
 import android.view.LayoutInflater;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
@@ -20,6 +22,7 @@ import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.core.content.ContextCompat;
 import androidx.fragment.app.Fragment;
 import androidx.lifecycle.ViewModelProvider;
 import androidx.recyclerview.widget.LinearLayoutManager;
@@ -51,6 +54,9 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
 
     private String currencySymbol = "¥";
     private String currentMonth;
+    private String lastRenderedMonth;
+    private int pendingAnimDirection;
+    private GestureDetector monthSwipeDetector;
 
     @Nullable
     @Override
@@ -77,6 +83,13 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
         ImageButton btnNext = view.findViewById(R.id.btn_next_month);
         btnPrev.setOnClickListener(v -> changeMonth(-1));
         btnNext.setOnClickListener(v -> changeMonth(1));
+        tvMonth.setOnClickListener(v -> showMonthPicker());
+        setupMonthSwipe();
+        // 标题、汇总卡等空白区域滑动也能切月（子 View 消费掉的事件不会到这里）
+        view.setOnTouchListener((v, event) -> {
+            monthSwipeDetector.onTouchEvent(event);
+            return false;
+        });
 
         view.findViewById(R.id.btn_add_plan).setOnClickListener(v -> showEditDialog(null));
 
@@ -86,8 +99,14 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
         currentMonth = viewModel.getMonthKey().getValue();
 
         viewModel.getMonthKey().observe(getViewLifecycleOwner(), key -> {
+            if (key == null) return;
+            String previous = lastRenderedMonth;
             currentMonth = key;
             tvMonth.setText(PlanMath.monthLabel(key));
+            if (previous != null && !previous.equals(key)) {
+                pendingAnimDirection = key.compareTo(previous) > 0 ? 1 : -1;
+            }
+            lastRenderedMonth = key;
         });
 
         viewModel.getPlans().observe(getViewLifecycleOwner(), plans -> {
@@ -95,6 +114,10 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
             boolean empty = plans == null || plans.isEmpty();
             tvEmpty.setVisibility(empty ? View.VISIBLE : View.GONE);
             rvPlans.setVisibility(empty ? View.GONE : View.VISIBLE);
+            if (pendingAnimDirection != 0) {
+                animateMonthChange(pendingAnimDirection);
+                pendingAnimDirection = 0;
+            }
         });
 
         viewModel.getSummary().observe(getViewLifecycleOwner(), summary -> {
@@ -129,6 +152,105 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
     private void changeMonth(int delta) {
         if (currentMonth == null) currentMonth = PlanMath.currentMonthKey();
         viewModel.setMonth(PlanMath.shiftMonthKey(currentMonth, delta));
+    }
+
+    /** 换月时列表从滑动方向淡入，和手势方向保持一致。 */
+    private void animateMonthChange(int direction) {
+        View target = rvPlans.getVisibility() == View.VISIBLE ? rvPlans : tvEmpty;
+        target.setAlpha(0.15f);
+        target.setTranslationX(direction * dp(28));
+        target.animate().alpha(1f).translationX(0f).setDuration(180).start();
+    }
+
+    /** 左右滑动切换月份：只认横向且速度足够的 fling，不干扰列表纵向滚动。 */
+    private void setupMonthSwipe() {
+        monthSwipeDetector = new GestureDetector(requireContext(), new GestureDetector.SimpleOnGestureListener() {
+            @Override
+            public boolean onDown(@NonNull MotionEvent e) {
+                return true;
+            }
+
+            @Override
+            public boolean onFling(@Nullable MotionEvent e1, @NonNull MotionEvent e2, float velocityX, float velocityY) {
+                if (e1 == null) return false;
+                float diffX = e2.getX() - e1.getX();
+                float diffY = e2.getY() - e1.getY();
+                if (Math.abs(diffX) > Math.abs(diffY) * 1.5f
+                        && Math.abs(diffX) > dp(56)
+                        && Math.abs(velocityX) > 200) {
+                    changeMonth(diffX > 0 ? -1 : 1);
+                    return true;
+                }
+                return false;
+            }
+        });
+
+        rvPlans.addOnItemTouchListener(new RecyclerView.SimpleOnItemTouchListener() {
+            @Override
+            public boolean onInterceptTouchEvent(@NonNull RecyclerView rv, @NonNull MotionEvent e) {
+                monthSwipeDetector.onTouchEvent(e);
+                return false; // 不抢 RecyclerView 的纵向滚动
+            }
+        });
+
+        // 空态时列表是 GONE，手势挂到提示文字上，避免没有列表就滑不动
+        tvEmpty.setOnTouchListener((v, event) -> {
+            monthSwipeDetector.onTouchEvent(event);
+            return false;
+        });
+    }
+
+    /** 点击月份弹出月历：年份左右翻，月份格子点一下直接跳过去。 */
+    private void showMonthPicker() {
+        if (getContext() == null || currentMonth == null || currentMonth.length() < 7) return;
+
+        View content = LayoutInflater.from(getContext()).inflate(R.layout.dialog_month_picker, null, false);
+        AlertDialog dialog = new AlertDialog.Builder(getContext()).setView(content).create();
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
+
+        final int[] cellIds = {
+                R.id.tv_picker_month_1, R.id.tv_picker_month_2, R.id.tv_picker_month_3, R.id.tv_picker_month_4,
+                R.id.tv_picker_month_5, R.id.tv_picker_month_6, R.id.tv_picker_month_7, R.id.tv_picker_month_8,
+                R.id.tv_picker_month_9, R.id.tv_picker_month_10, R.id.tv_picker_month_11, R.id.tv_picker_month_12
+        };
+        final int baseYear = Integer.parseInt(currentMonth.substring(0, 4));
+        final int baseMonth = Integer.parseInt(currentMonth.substring(5, 7));
+        final int[] shownYear = {baseYear};
+
+        TextView tvYear = content.findViewById(R.id.tv_picker_year);
+        Runnable render = () -> {
+            tvYear.setText(String.format(Locale.CHINA, "%d年", shownYear[0]));
+            for (int i = 0; i < cellIds.length; i++) {
+                TextView cell = content.findViewById(cellIds[i]);
+                boolean selected = shownYear[0] == baseYear && (i + 1) == baseMonth;
+                cell.setBackgroundResource(selected ? R.drawable.bg_month_picker_selected : R.drawable.bg_month_picker_normal);
+                cell.setTextColor(ContextCompat.getColor(requireContext(),
+                        selected ? R.color.text_white : R.color.text_primary));
+            }
+        };
+        render.run();
+
+        content.findViewById(R.id.btn_picker_prev_year).setOnClickListener(v -> {
+            shownYear[0]--;
+            render.run();
+        });
+        content.findViewById(R.id.btn_picker_next_year).setOnClickListener(v -> {
+            shownYear[0]++;
+            render.run();
+        });
+
+        for (int i = 0; i < cellIds.length; i++) {
+            final int month = i + 1;
+            content.findViewById(cellIds[i]).setOnClickListener(v -> {
+                viewModel.setMonth(String.format(Locale.CHINA, "%04d-%02d", shownYear[0], month));
+                dialog.dismiss();
+            });
+        }
+        content.findViewById(R.id.btn_picker_cancel).setOnClickListener(v -> dialog.dismiss());
+
+        dialog.show();
     }
 
     private String money(double value) {
