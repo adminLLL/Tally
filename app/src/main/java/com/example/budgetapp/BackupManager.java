@@ -8,6 +8,7 @@ import android.util.Log;
 
 import com.example.budgetapp.database.AssetAccount;
 import com.example.budgetapp.database.AppDatabase;
+import com.example.budgetapp.database.ExpensePlan;
 import com.example.budgetapp.database.Goal;
 import com.example.budgetapp.database.RenewalItem;
 import com.example.budgetapp.database.Transaction;
@@ -109,6 +110,9 @@ public class BackupManager {
             }
         }
         data.appPreferences = prefsMap;
+
+        // 【计划】月度支出计划（老版本读取时忽略该字段，故不影响兼容）
+        data.expensePlans = AppDatabase.getDatabase(context).expensePlanDao().getAllSync();
 
         String jsonString = gson.toJson(data);
         try (OutputStream outputStream = context.getContentResolver().openOutputStream(uri);
@@ -1261,6 +1265,9 @@ public class BackupManager {
                         }
                     }
 
+                    // 【计划】恢复月度支出计划（老备份无此字段时跳过）
+                    restoreExpensePlans(context, data.expensePlans);
+
                     // 【修复】按照原数据类型恢复，防止类型转换异常崩溃
                     if (data.appPreferences != null) {
                         SharedPreferences.Editor editor = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE).edit();
@@ -2152,6 +2159,32 @@ public class BackupManager {
         return data;
     }
     // ... (rest of the helper methods: restoreAssistantConfig, joinSet, splitSet, parseCsvLine, parseDoubleSafe, escapeCsv remain unchanged) ...
+    // ============================================================================================
+    // 【计划】月度支出计划恢复：按 (月份+名称+金额) 去重，老备份缺该字段时直接跳过
+    // ============================================================================================
+    private static void restoreExpensePlans(Context context, List<ExpensePlan> plans) {
+        if (plans == null || plans.isEmpty()) return;
+        AppDatabase db = AppDatabase.getDatabase(context);
+        Set<String> existing = new HashSet<>();
+        for (ExpensePlan plan : db.expensePlanDao().getAllSync()) {
+            existing.add(planKey(plan));
+        }
+        for (ExpensePlan plan : plans) {
+            if (plan == null) continue;
+            String key = planKey(plan);
+            if (existing.contains(key)) continue;
+            plan.id = 0; // 重置主键，交给数据库分配
+            if (plan.priority < 0) plan.priority = 0;
+            db.expensePlanDao().insert(plan);
+            existing.add(key);
+        }
+    }
+
+    private static String planKey(ExpensePlan plan) {
+        return (plan.monthKey == null ? "" : plan.monthKey) + "|"
+                + (plan.title == null ? "" : plan.title) + "|" + plan.amount;
+    }
+
     private static void restoreAssistantConfig(Context context, BackupData.AssistantConfigData cd) {
         if (cd == null) return;
         AssistantConfig config = new AssistantConfig(context);
@@ -2283,6 +2316,9 @@ public class BackupManager {
             }
         }
         data.appPreferences = prefsMap;
+
+        // 【计划】月度支出计划（老版本读取时忽略该字段，故不影响兼容）
+        data.expensePlans = AppDatabase.getDatabase(context).expensePlanDao().getAllSync();
 
         String jsonString = gson.toJson(data);
 
@@ -2417,6 +2453,9 @@ public class BackupManager {
                     if (data.renewalList != null) {
                         new AssistantConfig(context).saveRenewalList(data.renewalList);
                     }
+
+                    // 【计划】恢复月度支出计划（老备份无此字段时跳过）
+                    restoreExpensePlans(context, data.expensePlans);
 
                     if (data.appPreferences != null) {
                         SharedPreferences.Editor editor = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE).edit();

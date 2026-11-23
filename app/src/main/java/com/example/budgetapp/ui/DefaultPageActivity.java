@@ -32,6 +32,7 @@ public class DefaultPageActivity extends AppCompatActivity {
     public static final int PAGE_BUDGET = 2;
     public static final int PAGE_ASSETS = 3;
     public static final int PAGE_STATS = 4;
+    public static final int PAGE_PLAN = 5;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -110,6 +111,9 @@ public class DefaultPageActivity extends AppCompatActivity {
             case PAGE_STATS:
                 ((RadioButton) findViewById(R.id.radioStats)).setChecked(true);
                 break;
+            case PAGE_PLAN:
+                ((RadioButton) findViewById(R.id.radioPlan)).setChecked(true);
+                break;
         }
 
         // 监听选择变化
@@ -132,6 +136,9 @@ public class DefaultPageActivity extends AppCompatActivity {
             } else if (checkedId == R.id.radioStats) {
                 selectedPage = PAGE_STATS;
                 pageName = "统计";
+            } else if (checkedId == R.id.radioPlan) {
+                selectedPage = PAGE_PLAN;
+                pageName = "计划";
             }
 
             // 保存设置

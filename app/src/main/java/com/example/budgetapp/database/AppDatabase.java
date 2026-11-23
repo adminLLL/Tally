@@ -10,7 +10,7 @@ import androidx.annotation.NonNull;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-@Database(entities = {Transaction.class, AssetAccount.class, Goal.class, RecurringRule.class}, version = 28, exportSchema = true)
+@Database(entities = {Transaction.class, AssetAccount.class, Goal.class, RecurringRule.class, ExpensePlan.class}, version = 29, exportSchema = true)
 public abstract class AppDatabase extends RoomDatabase {
 
     public abstract TransactionDao transactionDao();
@@ -19,6 +19,8 @@ public abstract class AppDatabase extends RoomDatabase {
     public abstract GoalDao goalDao();
     
     public abstract RecurringRuleDao recurringRuleDao();
+
+    public abstract ExpensePlanDao expensePlanDao();
 
     private static volatile AppDatabase INSTANCE;
     private static final int NUMBER_OF_THREADS = 4;
@@ -238,6 +240,26 @@ public abstract class AppDatabase extends RoomDatabase {
         }
     };
 
+    // 【计划】28 -> 29：新增月度支出计划表。只建新表、不动老表，保证升级后原有数据完全不变。
+    static final Migration MIGRATION_28_29 = new Migration(28, 29) {
+        @Override
+        public void migrate(@NonNull SupportSQLiteDatabase database) {
+            database.execSQL("CREATE TABLE IF NOT EXISTS `expense_plans` (" +
+                    "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                    "`title` TEXT, " +
+                    "`amount` REAL NOT NULL, " +
+                    "`monthKey` TEXT, " +
+                    "`priority` INTEGER NOT NULL, " +
+                    "`completed` INTEGER NOT NULL, " +
+                    "`actualAmount` REAL NOT NULL, " +
+                    "`linkedTransactionIds` TEXT, " +
+                    "`completedAt` INTEGER NOT NULL, " +
+                    "`createdAt` INTEGER NOT NULL, " +
+                    "`updatedAt` INTEGER NOT NULL)");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_expense_plans_monthKey` ON `expense_plans` (`monthKey`)");
+        }
+    };
+
     public static AppDatabase getDatabase(final Context context) {
         if (INSTANCE == null) {
             synchronized (AppDatabase.class) {
@@ -254,7 +276,7 @@ public abstract class AppDatabase extends RoomDatabase {
                                     MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
                                     MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
                                     MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
-                                    MIGRATION_26_27, MIGRATION_27_28
+                                    MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29
                             )
                             // 注意：1->2 的迁移在历史版本里就缺失，保留 destructive fallback 是为了让
                             // 极老的库还能“清库启动”，而不是直接崩在打开数据库那一步。新增版本请补迁移。

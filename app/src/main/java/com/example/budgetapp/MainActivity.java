@@ -216,6 +216,9 @@ public class MainActivity extends AppCompatActivity {
                 case 4: // 统计
                     targetNavId = R.id.nav_stats;
                     break;
+                case 5: // 计划
+                    targetNavId = R.id.nav_plan;
+                    break;
             }
             
             // 如果不是默认的记账页面，则跳转到指定页面
@@ -261,7 +264,13 @@ public class MainActivity extends AppCompatActivity {
                     assetsTab.setOnLongClickListener(v -> true);
                 }
 
-                // 4. 明细: 屏蔽默认长按提示
+                // 4. 计划: 屏蔽默认长按提示
+                View planTab = bottomNav.findViewById(R.id.nav_plan);
+                if (planTab != null) {
+                    planTab.setOnLongClickListener(v -> true);
+                }
+
+                // 5. 明细: 屏蔽默认长按提示
                 View detailsTab = bottomNav.findViewById(R.id.nav_details);
                 if (detailsTab != null) {
                     detailsTab.setOnLongClickListener(v -> true);
@@ -276,7 +285,8 @@ public class MainActivity extends AppCompatActivity {
                         int currentId = navController.getCurrentDestination().getId();
                         // 新增 R.id.nav_details
                         if (currentId == R.id.nav_record || currentId == R.id.nav_assets ||
-                                currentId == R.id.nav_stats || currentId == R.id.nav_details) {
+                                currentId == R.id.nav_stats || currentId == R.id.nav_details ||
+                                currentId == R.id.nav_plan) {
                             finish();
                         } else {
                             if (!navController.popBackStack()) {
