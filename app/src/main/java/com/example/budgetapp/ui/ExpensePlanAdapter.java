@@ -99,7 +99,7 @@ public class ExpensePlanAdapter extends RecyclerView.Adapter<ExpensePlanAdapter.
                 if (links > 0) sub += " · 关联 " + links + " 笔流水";
                 tvSub.setText(sub);
                 tvStatus.setText("√");
-                tvStatus.setContentDescription("取消完成");
+                tvStatus.setContentDescription("已完成");
                 tvStatus.setBackgroundResource(R.drawable.bg_plan_status_done);
                 tvStatus.setTextColor(ContextCompat.getColor(itemView.getContext(), R.color.expense_green));
             } else {

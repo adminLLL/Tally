@@ -6,9 +6,7 @@ import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
 import android.os.Bundle;
-import android.view.GestureDetector;
 import android.view.LayoutInflater;
-import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
@@ -56,7 +54,6 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
     private String currentMonth;
     private String lastRenderedMonth;
     private int pendingAnimDirection;
-    private GestureDetector monthSwipeDetector;
 
     @Nullable
     @Override
@@ -84,12 +81,9 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
         btnPrev.setOnClickListener(v -> changeMonth(-1));
         btnNext.setOnClickListener(v -> changeMonth(1));
         tvMonth.setOnClickListener(v -> showMonthPicker());
-        setupMonthSwipe();
-        // 标题、汇总卡等空白区域滑动也能切月（子 View 消费掉的事件不会到这里）
-        view.setOnTouchListener((v, event) -> {
-            monthSwipeDetector.onTouchEvent(event);
-            return false;
-        });
+
+        SwipeMonthLayout swipeLayout = (SwipeMonthLayout) view;
+        swipeLayout.setOnMonthSwipeListener(this::changeMonth);
 
         view.findViewById(R.id.btn_add_plan).setOnClickListener(v -> showEditDialog(null));
 
@@ -162,44 +156,6 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
         target.animate().alpha(1f).translationX(0f).setDuration(180).start();
     }
 
-    /** 左右滑动切换月份：只认横向且速度足够的 fling，不干扰列表纵向滚动。 */
-    private void setupMonthSwipe() {
-        monthSwipeDetector = new GestureDetector(requireContext(), new GestureDetector.SimpleOnGestureListener() {
-            @Override
-            public boolean onDown(@NonNull MotionEvent e) {
-                return true;
-            }
-
-            @Override
-            public boolean onFling(@Nullable MotionEvent e1, @NonNull MotionEvent e2, float velocityX, float velocityY) {
-                if (e1 == null) return false;
-                float diffX = e2.getX() - e1.getX();
-                float diffY = e2.getY() - e1.getY();
-                if (Math.abs(diffX) > Math.abs(diffY) * 1.5f
-                        && Math.abs(diffX) > dp(56)
-                        && Math.abs(velocityX) > 200) {
-                    changeMonth(diffX > 0 ? -1 : 1);
-                    return true;
-                }
-                return false;
-            }
-        });
-
-        rvPlans.addOnItemTouchListener(new RecyclerView.SimpleOnItemTouchListener() {
-            @Override
-            public boolean onInterceptTouchEvent(@NonNull RecyclerView rv, @NonNull MotionEvent e) {
-                monthSwipeDetector.onTouchEvent(e);
-                return false; // 不抢 RecyclerView 的纵向滚动
-            }
-        });
-
-        // 空态时列表是 GONE，手势挂到提示文字上，避免没有列表就滑不动
-        tvEmpty.setOnTouchListener((v, event) -> {
-            monthSwipeDetector.onTouchEvent(event);
-            return false;
-        });
-    }
-
     /** 点击月份弹出月历：年份左右翻，月份格子点一下直接跳过去。 */
     private void showMonthPicker() {
         if (getContext() == null || currentMonth == null || currentMonth.length() < 7) return;
@@ -270,11 +226,11 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
     @Override
     public void onToggleComplete(ExpensePlan plan) {
         if (plan.completed) {
-            viewModel.reopenPlan(plan.id);
-            toast("已取消完成");
-        } else {
-            showCompleteDialog(plan);
+            // 已完成的项目再点 √ 不再打开选择窗口，重置统一走详情页的「重置」按钮
+            toast("已完成，如需重置请在详情中操作");
+            return;
         }
+        showCompleteDialog(plan);
     }
 
     @Override
@@ -443,7 +399,7 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
         TextView tvMonthLabel = view.findViewById(R.id.tv_detail_month);
         TextView tvPriority = view.findViewById(R.id.tv_detail_priority);
         TextView tvStatus = view.findViewById(R.id.tv_detail_status);
-        TextView tvLinksLabel = view.findViewById(R.id.tv_detail_links_label);
+        View linksHeader = view.findViewById(R.id.ll_detail_links_header);
         TextView tvLinks = view.findViewById(R.id.tv_detail_links);
         Button btnToggle = view.findViewById(R.id.btn_detail_toggle);
 
@@ -457,7 +413,7 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
             tvStatus.setTextColor(getResources().getColor(R.color.expense_green, null));
             btnToggle.setText("取消完成");
             int count = PlanViewModel.parseIds(plan.linkedTransactionIds).size();
-            tvLinksLabel.setVisibility(View.VISIBLE);
+            linksHeader.setVisibility(View.VISIBLE);
             tvLinks.setVisibility(View.VISIBLE);
             tvLinks.setText("已关联 " + count + " 笔支出流水，合计 " + money(plan.actualAmount));
         } else {
@@ -485,6 +441,12 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
         view.findViewById(R.id.btn_detail_delete).setOnClickListener(v -> {
             dialog.dismiss();
             confirmDelete(plan);
+        });
+        View btnReset = view.findViewById(R.id.btn_detail_reset);
+        btnReset.setOnClickListener(v -> {
+            viewModel.reopenPlan(plan.id);
+            toast("已重置");
+            dialog.dismiss();
         });
         view.findViewById(R.id.btn_detail_close).setOnClickListener(v -> dialog.dismiss());
 
@@ -559,11 +521,14 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
                         + (transaction.category == null ? "" : transaction.category) + "  "
                         + currencySymbol + String.format(Locale.CHINA, "%.2f", transaction.amount);
                 if (transaction.note != null && !transaction.note.trim().isEmpty()) {
-                    String note = transaction.note.trim();
-                    if (note.length() > 12) note = note.substring(0, 12) + "…";
-                    label += "  " + note;
+                    // 备注完整显示，过长由换行承担，避免看不出来是哪一笔
+                    label += "\n" + transaction.note.trim();
                 }
                 checkBox.setText(label);
+                checkBox.setSingleLine(false);
+                checkBox.setMaxLines(6);
+                checkBox.setLineSpacing(0f, 1.1f);
+                checkBox.setPadding(dp(4), dp(6), dp(4), dp(6));
                 final long transactionId = transaction.id;
                 final double amount = transaction.amount;
                 checkBox.setOnCheckedChangeListener((buttonView, isChecked) -> {
