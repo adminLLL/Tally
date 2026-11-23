@@ -48,6 +48,7 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
     private RecyclerView rvPlans;
     private TextView tvMonth, tvEmpty;
     private TextView tvSummaryPlanned, tvSummaryActual, tvSummaryOverspend, tvSummaryProgress;
+    private TextView tvSummaryOverspendLabel;
     private ExpensePlanAdapter adapter;
 
     private String currencySymbol = "¥";
@@ -68,6 +69,7 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
         tvSummaryPlanned = view.findViewById(R.id.tv_summary_planned);
         tvSummaryActual = view.findViewById(R.id.tv_summary_actual);
         tvSummaryOverspend = view.findViewById(R.id.tv_summary_overspend);
+        tvSummaryOverspendLabel = view.findViewById(R.id.tv_summary_overspend_label);
         tvSummaryProgress = view.findViewById(R.id.tv_summary_progress);
 
         rvPlans = view.findViewById(R.id.rv_plans);
@@ -118,7 +120,18 @@ public class PlanFragment extends Fragment implements ExpensePlanAdapter.Listene
             if (summary == null) return;
             tvSummaryPlanned.setText(money(summary.planned));
             tvSummaryActual.setText(money(summary.actual));
-            tvSummaryOverspend.setText(money(summary.overspend));
+            // 未超支时同一位置显示「节约金额」，用绿色，避免出现 ¥0.00 的超支数字
+            double balance = summary.actual - summary.planned;
+            if (balance > 0.005) {
+                tvSummaryOverspendLabel.setText("超支金额");
+                tvSummaryOverspend.setText(money(balance));
+                tvSummaryOverspend.setTextColor(getResources().getColor(R.color.income_red, null));
+            } else {
+                tvSummaryOverspendLabel.setText("节约金额");
+                double saved = Math.abs(balance) < 0.005 ? 0d : -balance;
+                tvSummaryOverspend.setText(money(saved));
+                tvSummaryOverspend.setTextColor(getResources().getColor(R.color.expense_green, null));
+            }
             String progress = "已完成 " + summary.progressText();
             if (summary.totalCount > 0) progress += " · " + summary.percent() + "%";
             tvSummaryProgress.setText(progress);
