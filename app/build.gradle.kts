@@ -25,6 +25,12 @@ android {
     }
 
     buildTypes {
+        // debug 变体换包名（.debug），可与已安装的正式版共存，互不影响数据
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
+
         release {
             isMinifyEnabled = false
             proguardFiles(

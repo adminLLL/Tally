@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- debug 变体与正式版共存，用不同名称区分，避免桌面上两个一模一样的图标 -->
+    <string name="app_name">Tally 调试</string>
+</resources>

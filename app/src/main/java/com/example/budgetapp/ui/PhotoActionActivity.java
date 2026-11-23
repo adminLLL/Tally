@@ -144,7 +144,7 @@ public class PhotoActionActivity extends AppCompatActivity {
         }
         if (photoFile != null) {
             currentPhotoUri = FileProvider.getUriForFile(this,
-                    "com.example.budgetapp.fileprovider",
+                    getPackageName() + ".fileprovider",
                     photoFile);
             takePhotoLauncher.launch(currentPhotoUri);
         }
