@@ -1,0 +1,326 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 允许查询 Shizuku 服务 -->
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:name=".MyApplication"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@drawable/ic_app_logo"
+        android:label="@string/app_name"
+        android:roundIcon="@drawable/ic_app_logo"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.BudgetApp">
+
+        <activity
+            android:name=".MainActivity"
+            android:windowSoftInputMode="adjustPan"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ui.AutoTrackLogActivity"
+            android:exported="false" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.example.budgetapp.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <activity android:name=".ui.PhotoBackupSettingsActivity"
+            android:label="照片备注设置"
+            android:theme="@style/Theme.BudgetApp"/>
+
+        <activity android:name=".ui.ThemeSettingsActivity" />
+
+        <activity
+            android:name=".ui.AiSettingActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.BudgetApp" />
+
+        <activity
+            android:name=".ui.AiCategoryRuleActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.BudgetApp" />
+
+        <activity
+            android:name=".ui.AiPromptEditorActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.BudgetApp" />
+
+        <activity
+            android:name=".ui.AiChatActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.BudgetApp">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ui.ImageViewerActivity"
+            android:exported="false"
+            android:theme="@style/Theme.AppCompat.NoActionBar" />
+
+        <activity android:name=".ui.PhotoActionActivity"
+            android:theme="@style/Theme.BudgetApp.Transparent"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"/>
+
+        <activity
+            android:name=".ui.AboutActivity"
+            android:label="关于"
+            android:theme="@style/Theme.BudgetApp"
+            android:exported="false"/>
+
+        <activity
+            android:name=".ui.SettingsActivity"
+            android:label="设置"
+            android:theme="@style/Theme.BudgetApp"
+            android:exported="false"/>
+
+        <activity
+            android:name=".ui.WebdavSettingsActivity"
+            android:label="WebDAV备份设置"
+            android:theme="@style/Theme.BudgetApp"
+            android:exported="false"/>
+
+        <activity
+            android:name=".ui.DonateActivity"
+            android:label="捐赠支持"
+            android:theme="@style/Theme.BudgetApp"
+            android:exported="false"/>
+
+        <activity
+            android:name=".ui.AiGuideActivity"
+            android:label="AI 记账配置指南"
+            android:theme="@style/Theme.BudgetApp"
+            android:exported="false"/>
+
+        <activity
+            android:name=".ui.AiModelManagerActivity"
+            android:label="模型配置管理"
+            android:theme="@style/Theme.BudgetApp"
+            android:exported="false"/>
+
+        <activity
+            android:name=".ui.SecuritySettingsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"/>
+
+        <activity
+            android:name=".ui.AuthActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"/>
+
+        <activity
+            android:name=".ui.BudgetManagementActivity"
+            android:label="预算管理设置"
+            android:exported="false"
+            android:theme="@style/Theme.BudgetApp" />
+
+        <activity
+            android:name=".ui.CategorySettingsActivity"
+            android:label="分类预设管理"
+            android:theme="@style/Theme.BudgetApp"
+            android:exported="false"/>
+
+        <activity android:name=".ui.AssistantManagerActivity" />
+
+        <activity
+            android:name=".KeywordSettingActivity"
+            android:label="关键字设置"
+            android:exported="false"/>
+
+        <activity android:name=".ui.AutoAssetActivity"
+            android:label="资产设置"
+            android:exported="false"
+            android:theme="@style/Theme.BudgetApp" />
+
+        <activity
+            android:name=".ui.AssetCategorySettingsActivity"
+            android:label="资产分类设置"
+            android:exported="false"
+            android:theme="@style/Theme.BudgetApp" />
+
+        <activity android:name=".ui.DefaultPageActivity"
+            android:label="应用默认页面设置"
+            android:exported="false"
+            android:theme="@style/Theme.BudgetApp" />
+
+        <activity
+            android:name=".ui.YearCalendarActivity"
+            android:label="年度账单"
+            android:theme="@style/Theme.BudgetApp"
+            android:exported="false"/>
+
+        <activity android:name=".ui.UserNoticeActivity" />
+
+        <activity android:name=".ui.PrivacyPolicyActivity" />
+
+        <activity
+            android:name=".ui.BudgetHistoryActivity"
+            android:theme="@style/Theme.BudgetApp"
+            android:exported="false" />
+
+        <activity
+            android:name=".ui.CurrencySettingsActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".ui.AutoRenewalActivity"
+            android:label="自动续费提醒设置"
+            android:exported="false"
+            android:theme="@style/Theme.BudgetApp" />
+
+        <activity
+            android:name=".ui.RecurringTransactionActivity"
+            android:label="周期记账"
+            android:exported="false"
+            android:theme="@style/Theme.BudgetApp" />
+
+        <activity
+            android:name=".ui.InstallmentDetailActivity"
+            android:label="分期详情"
+            android:exported="false"
+            android:theme="@style/Theme.BudgetApp" />
+
+        <service
+            android:name=".service.QuickAddTileService"
+            android:icon="@drawable/ic_qs_record"
+            android:label="记一笔"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name="com.google.android.accessibility.selecttospeak.SelectToSpeakService"
+            android:exported="true"
+            android:label="Tally无障碍记账"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:foregroundServiceType="dataSync">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <receiver
+            android:name=".widget.TodaySummaryWidget"
+            android:exported="true"
+            android:label="@string/widget_name_today"> <intent-filter>
+            <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+        </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/today_summary_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.MonthSummaryWidget"
+            android:exported="true"
+            android:label="@string/widget_name_month"> <intent-filter>
+            <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+        </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/month_summary_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.CombinedSummaryWidget"
+            android:exported="true"
+            android:label="@string/widget_name_combined"> <intent-filter>
+            <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+        </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/combined_summary_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.OvertimeSummaryWidget"
+            android:exported="true"
+            android:label="@string/widget_name_overtime"> <intent-filter>
+            <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+        </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/overtime_summary_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.TodayBudgetWidget"
+            android:exported="true"
+            android:label="@string/widget_name_budget"> <intent-filter>
+            <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+        </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/today_budget_widget_info" />
+        </receiver>
+
+
+        <receiver
+            android:name=".service.DailyInterestService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.example.budgetapp.action.DAILY_INTEREST" />
+            </intent-filter>
+        </receiver>
+<!--        <service android:name=".service.NotificationMonitorService"-->
+<!--            android:label="退款通知监听"-->
+<!--            android:exported="true"-->
+<!--            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">-->
+<!--            <intent-filter>-->
+<!--                <action android:name="android.service.notification.NotificationListenerService" />-->
+<!--            </intent-filter>-->
+<!--        </service>-->
+
+    </application>
+
+</manifest>

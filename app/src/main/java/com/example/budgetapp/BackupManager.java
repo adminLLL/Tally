@@ -1,0 +1,2499 @@
+package com.example.budgetapp;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.net.Uri;
+import android.text.TextUtils;
+import android.util.Log;
+
+import com.example.budgetapp.database.AssetAccount;
+import com.example.budgetapp.database.AppDatabase;
+import com.example.budgetapp.database.Goal;
+import com.example.budgetapp.database.RenewalItem;
+import com.example.budgetapp.database.Transaction;
+import com.example.budgetapp.util.AssistantConfig;
+import com.example.budgetapp.util.AutoAssetManager;
+import com.example.budgetapp.util.CategoryManager;
+import com.google.gson.Gson;
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.DateUtil;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.ss.usermodel.Workbook;
+import org.apache.poi.ss.usermodel.WorkbookFactory;
+
+public class BackupManager {
+
+    private static final String JSON_FILE_NAME = "backup_data.json";
+
+    // ============================================================================================
+    // ZIP 导出/导入 (JSON格式)
+    // ============================================================================================
+    public static void exportToZip(Context context, Uri uri, List<Transaction> transactions, List<AssetAccount> assets, List<Goal> goals) throws Exception {
+        if (transactions == null) transactions = new ArrayList<>();
+        if (assets == null) assets = new ArrayList<>();
+        if (goals == null) goals = new ArrayList<>();
+        Gson gson = new Gson();
+        
+        BackupData data = new BackupData(transactions, assets, goals);
+        
+        List<String> expenseCats = CategoryManager.getExpenseCategories(context);
+        List<String> incomeCats = CategoryManager.getIncomeCategories(context);
+        data.expenseCategories = expenseCats;
+        data.incomeCategories = incomeCats;
+
+        Map<String, List<String>> subMap = new HashMap<>();
+        List<String> allCats = new ArrayList<>(expenseCats);
+        allCats.addAll(incomeCats);
+        for (String parent : allCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, parent);
+            if (subs != null && !subs.isEmpty()) {
+                subMap.put(parent, subs);
+            }
+        }
+        data.subCategoryMap = subMap;
+
+        List<AutoAssetManager.AssetRule> rules = AutoAssetManager.getRules(context);
+        List<String> ruleStrings = new ArrayList<>();
+        for (AutoAssetManager.AssetRule rule : rules) {
+            ruleStrings.add(rule.toString());
+        }
+        data.autoAssetRules = ruleStrings;
+
+        AssistantConfig config = new AssistantConfig(context);
+        BackupData.AssistantConfigData configData = new BackupData.AssistantConfigData();
+        configData.enableAutoTrack = config.isEnabled();
+//        configData.enableRefund = config.isRefundEnabled();
+        configData.enableAssets = config.isAssetsEnabled();
+        configData.defaultAssetId = config.getDefaultAssetId();
+        configData.expenseKeywords = config.getExpenseKeywords();
+        configData.incomeKeywords = config.getIncomeKeywords();
+        configData.weekdayRate = config.getWeekdayOvertimeRate();
+        configData.holidayRate = config.getHolidayOvertimeRate();
+        configData.monthlyBaseSalary = config.getMonthlyBaseSalary();
+        
+        data.assistantConfig = configData;
+
+        // 【新增】保存自动续费列表
+        data.renewalList = config.getRenewalList();
+
+        // 【周期记账】保存周期记账规则
+        AppDatabase db = AppDatabase.getDatabase(context);
+        List<com.example.budgetapp.database.RecurringRule> recurringRules = db.recurringRuleDao().getAllRulesSync();
+        data.recurringRules = recurringRules;
+
+        // 【修复】携带原始数据类型保存 SharedPreferences
+        SharedPreferences prefs = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE);
+        Map<String, BackupData.PrefItem> prefsMap = new HashMap<>();
+        for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
+            if (entry.getValue() != null) {
+                String type = entry.getValue().getClass().getSimpleName();
+                prefsMap.put(entry.getKey(), new BackupData.PrefItem(type, String.valueOf(entry.getValue())));
+            }
+        }
+        data.appPreferences = prefsMap;
+
+        String jsonString = gson.toJson(data);
+        try (OutputStream outputStream = context.getContentResolver().openOutputStream(uri);
+             ZipOutputStream zos = new ZipOutputStream(outputStream)) {
+            ZipEntry entry = new ZipEntry(JSON_FILE_NAME);
+            zos.putNextEntry(entry);
+            zos.write(jsonString.getBytes(StandardCharsets.UTF_8));
+            zos.closeEntry();
+        }
+
+    }
+
+
+
+    // ============================================================================================
+    // 一木记账账单导入 (支持 xls/xlsx)
+    // ============================================================================================
+    public static BackupData importFromYimu(Context context, Uri uri, List<AssetAccount> allAssets) throws Exception {
+        List<Transaction> transactions = new ArrayList<>();
+        List<AssetAccount> newAssetsToCreate = new ArrayList<>();
+        Map<String, Integer> newAssetMap = new HashMap<>();
+
+        // 获取现有的分类结构
+        List<String> expCats = new ArrayList<>(CategoryManager.getExpenseCategories(context));
+        List<String> incCats = new ArrayList<>(CategoryManager.getIncomeCategories(context));
+        Map<String, List<String>> subCatMap = new HashMap<>();
+        for (String cat : expCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, cat);
+            if (subs != null && !subs.isEmpty()) subCatMap.put(cat, subs);
+        }
+        for (String cat : incCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, cat);
+            if (subs != null && !subs.isEmpty()) subCatMap.put(cat, subs);
+        }
+
+        int maxAssetId = 0;
+        if (allAssets != null) {
+            for (AssetAccount a : allAssets) {
+                if (a.id > maxAssetId) maxAssetId = a.id;
+            }
+        }
+
+        // 使用项目已有的 Apache POI 库读取 Excel
+        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
+             Workbook workbook = WorkbookFactory.create(inputStream)) {
+
+            Sheet sheet = workbook.getSheetAt(0); // 默认读取第一个工作表
+            boolean isDataSection = false;
+
+            int timeIdx = -1, typeIdx = -1, amountIdx = -1, catIdx = -1, subCatIdx = -1, accountIdx = -1, remarkIdx = -1;
+
+            SimpleDateFormat sdf1 = new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault());
+            SimpleDateFormat sdf2 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
+
+            for (Row row : sheet) {
+                if (row == null) continue;
+
+                // 1. 寻找表头行，确定各列的索引
+                if (!isDataSection) {
+                    String firstCell = getCellText(row.getCell(0));
+                    if ("日期".equals(firstCell) || firstCell.contains("日期")) {
+                        isDataSection = true;
+                        for (int i = 0; i < row.getLastCellNum(); i++) {
+                            String header = getCellText(row.getCell(i)).trim();
+                            if ("日期".equals(header)) timeIdx = i;
+                            else if ("收支类型".equals(header)) typeIdx = i;
+                            else if ("金额".equals(header)) amountIdx = i;
+                            else if ("类别".equals(header)) catIdx = i;
+                            else if ("二级分类".equals(header)) subCatIdx = i;
+                            else if ("账户".equals(header)) accountIdx = i;
+                            else if ("备注".equals(header)) remarkIdx = i;
+                        }
+                    }
+                    continue; // 表头行处理完毕，跳过本次循环
+                }
+
+                // 2. 解析数据行
+                if (timeIdx == -1 || typeIdx == -1 || amountIdx == -1) continue; // 关键列缺失
+
+                String timeStr = getCellText(row.getCell(timeIdx)).trim();
+                if (TextUtils.isEmpty(timeStr) || !timeStr.contains("-")) continue; // 无效时间直接跳过
+
+                Transaction t = new Transaction();
+
+                // === 解析时间 ===
+                Date date = null;
+                try {
+                    date = sdf1.parse(timeStr);
+                    t.date = (date != null) ? date.getTime() : System.currentTimeMillis();
+                } catch (Exception e) {
+                    try {
+                        date = sdf2.parse(timeStr);
+                        t.date = (date != null) ? date.getTime() : System.currentTimeMillis();
+                    } catch (Exception e2) {
+                        t.date = System.currentTimeMillis();
+                    }
+                }
+
+                // 兜底：如果解析失败，使用当前时间
+                if (date == null) {
+                    date = new Date(t.date);
+                }
+
+                // === 备注与标识 ===
+                // 将时间格式化为项目规范的 "MM-dd HH:mm"
+                SimpleDateFormat noteDateFmt = new SimpleDateFormat("MM-dd HH:mm", Locale.getDefault());
+                String noteTimePart = noteDateFmt.format(date);
+
+                // 提取备注并拼装记录标识
+                String remarkStr = (remarkIdx != -1) ? getCellText(row.getCell(remarkIdx)).trim() : "";
+                t.remark = "";
+
+                // 统一策略：没有备注只保留时间，有备注则加上空格和备注
+                if (TextUtils.isEmpty(remarkStr)) {
+                    t.note = noteTimePart;
+                } else {
+                    t.note = noteTimePart + " " + remarkStr;
+                }
+
+                // 收支类型
+                String typeStr = (typeIdx != -1) ? getCellText(row.getCell(typeIdx)).trim() : "";
+                if ("收入".equals(typeStr)) {
+                    t.type = 1;
+                } else {
+                    t.type = 0; // "支出" 默认当作 0
+                }
+
+                // 金额 (一木支出的金额可能带有负号，取绝对值)
+                String amountStr = getCellText(row.getCell(amountIdx)).replace("¥", "").replace(",", "").trim();
+                t.amount = Math.abs(parseDoubleSafe(amountStr));
+
+                // 类别处理
+                String category = (catIdx != -1) ? getCellText(row.getCell(catIdx)).trim() : "";
+                if (TextUtils.isEmpty(category)) category = "其它";
+                String subCategory = (subCatIdx != -1) ? getCellText(row.getCell(subCatIdx)).trim() : "";
+
+                List<String> targetList = (t.type == 1) ? incCats : expCats;
+                if (!targetList.contains(category)) {
+                    targetList.add(category);
+                }
+
+                if (!TextUtils.isEmpty(subCategory)) {
+                    List<String> subs = subCatMap.get(category);
+                    if (subs == null) {
+                        subs = new ArrayList<>();
+                        subCatMap.put(category, subs);
+                    }
+                    if (!subs.contains(subCategory)) {
+                        subs.add(subCategory);
+                    }
+                }
+                t.category = category;
+                t.subCategory = subCategory;
+
+                // 账户处理
+                String accountName = (accountIdx != -1) ? getCellText(row.getCell(accountIdx)).trim() : "";
+                if (TextUtils.isEmpty(accountName)) {
+                    accountName = "默认账户";
+                }
+
+                int matchedId = matchAssetId(accountName, allAssets);
+                if (matchedId == 0 && !"/".equals(accountName)) {
+                    if (newAssetMap.containsKey(accountName)) {
+                        t.assetId = newAssetMap.get(accountName);
+                    } else {
+                        maxAssetId++;
+                        int newId = maxAssetId;
+                        AssetAccount newAsset = new AssetAccount(accountName, 0.0, 0);
+                        newAsset.id = newId;
+                        newAssetsToCreate.add(newAsset);
+                        newAssetMap.put(accountName, newId);
+                        t.assetId = newId;
+                    }
+                } else {
+                    t.assetId = matchedId;
+                }
+
+                transactions.add(t);
+            }
+        }
+
+        BackupData data = new BackupData(transactions, newAssetsToCreate);
+        data.expenseCategories = expCats;
+        data.incomeCategories = incCats;
+        data.subCategoryMap = subCatMap;
+        return data;
+    }
+
+    // ============================================================================================
+    // Verifin 账单导入 (支持直接导入 JSON 或 ZIP 压缩包)
+    // ============================================================================================
+    public static BackupData importFromVerifin(Context context, Uri uri, List<AssetAccount> allAssets) throws Exception {
+        List<Transaction> transactions = new ArrayList<>();
+        List<AssetAccount> newAssetsToCreate = new ArrayList<>();
+        Map<String, Integer> newAssetMap = new HashMap<>();
+
+        List<String> expCats = new ArrayList<>(CategoryManager.getExpenseCategories(context));
+        List<String> incCats = new ArrayList<>(CategoryManager.getIncomeCategories(context));
+        Map<String, List<String>> subCatMap = new HashMap<>();
+
+        int maxAssetId = 0;
+        if (allAssets != null) {
+            for (AssetAccount a : allAssets) {
+                if (a.id > maxAssetId) maxAssetId = a.id;
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        boolean foundInZip = false;
+
+        // 1. 首先尝试作为 ZIP 压缩包来读取
+        try (InputStream is = context.getContentResolver().openInputStream(uri);
+             ZipInputStream zis = new ZipInputStream(is)) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                // 寻找压缩包内的 backup.json 或任何 .json 文件
+                if (entry.getName().endsWith(".json")) {
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(zis, StandardCharsets.UTF_8));
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        sb.append(line);
+                    }
+                    foundInZip = true;
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            // 解析 ZIP 失败，可能是个普通的文本文件，忽略此异常
+        }
+
+        // 2. 如果不是压缩包，或者压缩包里没找到 JSON，就作为普通文本直接读取
+        if (!foundInZip) {
+            sb.setLength(0); // 清空
+            try (InputStream is = context.getContentResolver().openInputStream(uri);
+                 BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    sb.append(line);
+                }
+            }
+        }
+
+        if (sb.length() == 0) {
+            throw new Exception("无法读取文件内容，或压缩包中未找到 JSON 数据");
+        }
+
+        org.json.JSONObject root = new org.json.JSONObject(sb.toString());
+        if (!root.has("data")) {
+            throw new Exception("无效的 Verifin 备份文件: 找不到 data 节点");
+        }
+        org.json.JSONObject dataObj = root.getJSONObject("data");
+
+        // 1. 缓存分类字典 (categoryId -> categoryName)
+        Map<String, String> categoryMap = new HashMap<>();
+        if (dataObj.has("categories")) {
+            org.json.JSONArray catsArr = dataObj.getJSONArray("categories");
+            for (int i = 0; i < catsArr.length(); i++) {
+                org.json.JSONObject catObj = catsArr.getJSONObject(i);
+                categoryMap.put(catObj.getString("id"), catObj.getString("label"));
+            }
+        }
+
+        // 2. 缓存账户字典 (accountId -> accountName)
+        Map<String, String> accountMap = new HashMap<>();
+        if (dataObj.has("accounts")) {
+            org.json.JSONArray accsArr = dataObj.getJSONArray("accounts");
+            for (int i = 0; i < accsArr.length(); i++) {
+                org.json.JSONObject accObj = accsArr.getJSONObject(i);
+                accountMap.put(accObj.getString("id"), accObj.getString("name"));
+            }
+        }
+
+        // 3. 解析交易记录 (Entries)
+        if (dataObj.has("entries")) {
+            org.json.JSONArray entriesArr = dataObj.getJSONArray("entries");
+            SimpleDateFormat parserSdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault());
+            SimpleDateFormat noteSdf = new SimpleDateFormat("MM-dd HH:mm", Locale.getDefault());
+
+            for (int i = 0; i < entriesArr.length(); i++) {
+                org.json.JSONObject entry = entriesArr.getJSONObject(i);
+                Transaction t = new Transaction();
+
+                // 解析类型 (expense -> 0, income -> 1, transfer -> 2)
+                String typeStr = entry.optString("type", "expense");
+                if ("income".equals(typeStr)) {
+                    t.type = 1;
+                } else if ("transfer".equals(typeStr)) {
+                    t.type = 2; // Tally 使用 2 代表互转
+                } else {
+                    t.type = 0;
+                }
+
+                // 解析金额
+                t.amount = Math.abs(entry.optDouble("amount", 0.0));
+
+                // 解析日期时间，兼容带有毫秒的情况 ("2026-09-29T17:09:22.849")
+                String dateStr = entry.optString("occurredAt", "");
+                if (dateStr.contains(".")) {
+                    dateStr = dateStr.substring(0, dateStr.indexOf('.'));
+                }
+                Date dateObj;
+                try {
+                    dateObj = parserSdf.parse(dateStr);
+                    t.date = (dateObj != null) ? dateObj.getTime() : System.currentTimeMillis();
+                } catch (Exception e) {
+                    dateObj = new Date();
+                    t.date = dateObj.getTime();
+                }
+
+                // --- 核心：匹配账户与分类 ---
+                String accId = entry.optString("accountId", "");
+                String accountName = accountMap.containsKey(accId) ? accountMap.get(accId) : "默认账户";
+                int matchedId = matchAssetId(accountName, allAssets);
+                if (matchedId == 0 && !TextUtils.isEmpty(accountName)) {
+                    if (newAssetMap.containsKey(accountName)) {
+                        t.assetId = newAssetMap.get(accountName);
+                    } else {
+                        maxAssetId++;
+                        AssetAccount newAsset = new AssetAccount(accountName, 0.0, 0);
+                        newAsset.id = maxAssetId;
+                        newAssetsToCreate.add(newAsset);
+                        newAssetMap.put(accountName, maxAssetId);
+                        t.assetId = maxAssetId;
+                    }
+                } else {
+                    t.assetId = matchedId;
+                }
+
+                t.remark = ""; // 贯彻策略：原生备注留空
+
+                if (t.type == 2) {
+                    // 如果是资产互转，Tally的规则是 "类别为资产互转，note为 A账户 -> B账户"
+                    t.category = "资产互转";
+                    t.subCategory = "";
+                    String toAccId = entry.optString("toAccountId", "");
+                    String toAccountName = accountMap.containsKey(toAccId) ? accountMap.get(toAccId) : "未知账户";
+                    t.note = accountName + " -> " + toAccountName;
+                } else {
+                    // 常规支出或收入
+                    String catId = entry.optString("categoryId", "");
+                    String categoryName = categoryMap.containsKey(catId) ? categoryMap.get(catId) : "其它";
+                    t.category = categoryName;
+                    t.subCategory = ""; // Verifin结构没有子分类
+
+                    // 动态创建分类
+                    if (t.type == 1 && !incCats.contains(categoryName)) incCats.add(categoryName);
+                    else if (t.type == 0 && !expCats.contains(categoryName)) expCats.add(categoryName);
+
+                    // 清洗 Verifin 备注：将原本的 "09-29 17:09 芝士奶盖..." 前面的时间剥离
+                    String rawNote = entry.optString("note", "");
+                    String parsedRemark = rawNote.replaceAll("^\\d{2}-\\d{2} \\d{2}:\\d{2}\\s*", "").trim();
+
+                    // 记录标识拼装策略：没备注不加 auto
+                    if (TextUtils.isEmpty(parsedRemark)) {
+                        t.note = noteSdf.format(dateObj);
+                    } else {
+                        t.note = noteSdf.format(dateObj) + " " + parsedRemark;
+                    }
+                }
+
+                transactions.add(t);
+            }
+        }
+
+        BackupData result = new BackupData(transactions, newAssetsToCreate);
+        result.expenseCategories = expCats;
+        result.incomeCategories = incCats;
+        result.subCategoryMap = subCatMap;
+        return result;
+    }
+
+    // ============================================================================================
+    // 小米钱包账单导入 (支持 xlsx)
+    // ============================================================================================
+    public static BackupData importFromXiaomi(Context context, Uri uri, List<AssetAccount> allAssets) throws Exception {
+        List<Transaction> transactions = new ArrayList<>();
+        List<AssetAccount> newAssets = new ArrayList<>(); // 小米账单通常不带账户名，默认归入“默认账户”
+
+        List<String> expCats = new ArrayList<>(CategoryManager.getExpenseCategories(context));
+        List<String> incCats = new ArrayList<>(CategoryManager.getIncomeCategories(context));
+        Map<String, List<String>> subCatMap = new HashMap<>();
+
+        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
+             Workbook workbook = WorkbookFactory.create(inputStream)) {
+
+            Sheet sheet = workbook.getSheetAt(0);
+            boolean isDataSection = false;
+
+            // 小米时间格式示例: 2026-04-23 08:34:15
+            SimpleDateFormat parserSdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
+            SimpleDateFormat noteSdf = new SimpleDateFormat("MM-dd HH:mm", Locale.getDefault());
+
+            int dateIdx = -1, catIdx = -1, subCatIdx = -1, typeIdx = -1, remarkIdx = -1, amtIdx = -1;
+
+            for (Row row : sheet) {
+                if (row == null) continue;
+
+                // 1. 识别表头
+                if (!isDataSection) {
+                    String firstCell = getCellText(row.getCell(0));
+                    if (firstCell.contains("账单日期") || firstCell.contains("记账分类")) {
+                        isDataSection = true;
+                        for (int i = 0; i < row.getLastCellNum(); i++) {
+                            String h = getCellText(row.getCell(i)).trim();
+                            if ("账单日期".equals(h)) dateIdx = i;
+                            else if ("记账分类".equals(h)) catIdx = i;
+                            else if ("分类子类".equals(h)) subCatIdx = i;
+                            else if ("收支类型".equals(h)) typeIdx = i;
+                            else if ("备注".equals(h)) remarkIdx = i;
+                            else if ("金额".equals(h)) amtIdx = i;
+                        }
+                    }
+                    continue;
+                }
+
+                // 2. 解析数据行
+                if (dateIdx == -1 || typeIdx == -1 || amtIdx == -1) continue;
+
+                String dateStr = getCellText(row.getCell(dateIdx)).trim();
+                if (TextUtils.isEmpty(dateStr)) continue;
+
+                Transaction t = new Transaction();
+
+                // 时间与记录标识
+                Date dateObj;
+                try {
+                    dateObj = parserSdf.parse(dateStr);
+                    t.date = (dateObj != null) ? dateObj.getTime() : System.currentTimeMillis();
+                } catch (Exception e) {
+                    dateObj = new Date();
+                    t.date = dateObj.getTime();
+                }
+
+                // 提取备注并拼装记录标识
+                String remark = (remarkIdx != -1) ? getCellText(row.getCell(remarkIdx)).trim() : "";
+                t.remark = "";
+
+                // 统一策略：没有备注只保留时间，有备注则加上空格和备注
+                if (TextUtils.isEmpty(remark)) {
+                    t.note = noteSdf.format(dateObj);
+                } else {
+                    t.note = noteSdf.format(dateObj) + " " + remark;
+                }
+                // 类型与金额
+                String typeStr = getCellText(row.getCell(typeIdx)).trim();
+                t.type = "收入".equals(typeStr) ? 1 : 0;
+                t.amount = Math.abs(parseDoubleSafe(getCellText(row.getCell(amtIdx))));
+
+                // 分类与二级分类
+                String category = getCellText(row.getCell(catIdx)).trim();
+                if (TextUtils.isEmpty(category)) category = "其它";
+                String subCategory = (subCatIdx != -1) ? getCellText(row.getCell(subCatIdx)).trim() : "";
+
+                List<String> targetList = (t.type == 1) ? incCats : expCats;
+                if (!targetList.contains(category)) targetList.add(category);
+
+                if (!TextUtils.isEmpty(subCategory)) {
+                    List<String> subs = subCatMap.get(category);
+                    if (subs == null) {
+                        subs = new ArrayList<>(CategoryManager.getSubCategories(context, category));
+                        subCatMap.put(category, subs);
+                    }
+                    if (!subs.contains(subCategory)) subs.add(subCategory);
+                }
+                t.category = category;
+                t.subCategory = subCategory;
+
+                // 账户映射（小米账单通常不指定，默认设为 ID 1 或 匹配“默认账户”）
+                t.assetId = matchAssetId("默认账户", allAssets);
+                if (t.assetId == 0 && allAssets != null && !allAssets.isEmpty()) {
+                    t.assetId = allAssets.get(0).id;
+                }
+
+                transactions.add(t);
+            }
+        }
+
+        BackupData data = new BackupData(transactions, newAssets);
+        data.expenseCategories = expCats;
+        data.incomeCategories = incCats;
+        data.subCategoryMap = subCatMap;
+        return data;
+    }
+    // ============================================================================================
+    // 飞鸭记账账单导入 (支持 CSV)
+    // ============================================================================================
+    public static BackupData importFromFeiya(Context context, Uri uri, List<AssetAccount> allAssets) throws Exception {
+        // 第一次尝试：GBK 编码
+        BackupData data = parseFeiyaCsvWithEncoding(context, uri, "GBK", allAssets);
+        // 如果解析为空，第二次尝试：UTF-8 编码
+        if (data.records == null || data.records.isEmpty()) {
+            data = parseFeiyaCsvWithEncoding(context, uri, "UTF-8", allAssets);
+        }
+        return data;
+    }
+
+    private static BackupData parseFeiyaCsvWithEncoding(Context context, Uri uri, String charsetName, List<AssetAccount> allAssets) throws Exception {
+        List<Transaction> transactions = new ArrayList<>();
+        List<AssetAccount> newAssetsToCreate = new ArrayList<>();
+        Map<String, Integer> newAssetMap = new HashMap<>();
+
+        List<String> expCats = new ArrayList<>(CategoryManager.getExpenseCategories(context));
+        List<String> incCats = new ArrayList<>(CategoryManager.getIncomeCategories(context));
+        Map<String, List<String>> subCatMap = new HashMap<>();
+
+        int maxAssetId = 0;
+        if (allAssets != null) {
+            for (AssetAccount a : allAssets) {
+                if (a.id > maxAssetId) maxAssetId = a.id;
+            }
+        }
+
+        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
+             BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, charsetName))) {
+
+            String line;
+            boolean isDataSection = false;
+            // 飞鸭的时间格式可能是 "2026-04-20" 也可能是带时间的格式，做多重兼容
+            SimpleDateFormat parserSdf1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
+            SimpleDateFormat parserSdf2 = new SimpleDateFormat("yyyy-MM-dd", Locale.getDefault());
+            SimpleDateFormat noteSdf = new SimpleDateFormat("MM-dd HH:mm", Locale.getDefault());
+
+            int timeIdx = -1, typeIdx = -1, catIdx = -1, subCatIdx = -1, amtIdx = -1, accIdx = -1, remarkIdx = -1;
+
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("\ufeff")) line = line.substring(1);
+                if (TextUtils.isEmpty(line.trim())) continue;
+
+                // 识别表头
+                if (!isDataSection && line.contains("时间") && line.contains("类型") && line.contains("金额")) {
+                    isDataSection = true;
+                    List<String> headers = parseCsvLine(line);
+                    for (int i = 0; i < headers.size(); i++) {
+                        String h = headers.get(i).trim();
+                        if ("时间".equals(h)) timeIdx = i;
+                        else if ("类型".equals(h)) typeIdx = i;
+                        else if ("分类".equals(h)) catIdx = i;
+                        else if ("二级分类".equals(h)) subCatIdx = i;
+                        else if ("金额".equals(h)) amtIdx = i;
+                        else if ("账户".equals(h)) accIdx = i;
+                        else if ("备注".equals(h)) remarkIdx = i;
+                    }
+                    continue;
+                }
+
+                if (!isDataSection) continue;
+
+                List<String> tokens = parseCsvLine(line);
+                if (tokens.size() <= Math.max(timeIdx, amtIdx)) continue; // 关键列缺失则跳过
+
+                Transaction t = new Transaction();
+
+                // 1. 类型映射
+                String typeStr = (typeIdx != -1 && typeIdx < tokens.size()) ? tokens.get(typeIdx).trim() : "";
+                t.type = "收入".equals(typeStr) ? 1 : 0; // 不是收入默认算作支出 (0)
+
+                // 2. 金额映射 (取绝对值)
+                t.amount = Math.abs(parseDoubleSafe(tokens.get(amtIdx).trim()));
+
+                // 3. 时间与记录标识映射
+                String dateStr = tokens.get(timeIdx).trim();
+                Date dateObj = null;
+                try { dateObj = parserSdf1.parse(dateStr); } catch (Exception ignored) {}
+                if (dateObj == null) {
+                    try { dateObj = parserSdf2.parse(dateStr); } catch (Exception ignored) {}
+                }
+                if (dateObj == null) dateObj = new Date(); // 解析失败兜底为当前时间
+
+                t.date = dateObj.getTime();
+
+                // 提取备注并拼装记录标识
+                String remark = (remarkIdx != -1 && remarkIdx < tokens.size()) ? tokens.get(remarkIdx).trim() : "";
+                t.remark = "";
+
+                // 统一策略：没有备注只保留时间，有备注则加上空格和备注
+                if (TextUtils.isEmpty(remark)) {
+                    t.note = noteSdf.format(dateObj);
+                } else {
+                    t.note = noteSdf.format(dateObj) + " " + remark;
+                }
+                // 4. 分类映射 (含动态新增)
+                String category = (catIdx != -1 && catIdx < tokens.size()) ? tokens.get(catIdx).trim() : "";
+                if (TextUtils.isEmpty(category)) category = "其它";
+                String subCategory = (subCatIdx != -1 && subCatIdx < tokens.size()) ? tokens.get(subCatIdx).trim() : "";
+
+                List<String> targetList = (t.type == 1) ? incCats : expCats;
+                if (!targetList.contains(category)) targetList.add(category);
+
+                if (!TextUtils.isEmpty(subCategory)) {
+                    List<String> subs = subCatMap.get(category);
+                    if (subs == null) {
+                        subs = new ArrayList<>(CategoryManager.getSubCategories(context, category));
+                        subCatMap.put(category, subs);
+                    }
+                    if (!subs.contains(subCategory)) subs.add(subCategory);
+                }
+                t.category = category;
+                t.subCategory = subCategory;
+
+                // 5. 账户映射 (含动态新增)
+                String accountName = (accIdx != -1 && accIdx < tokens.size()) ? tokens.get(accIdx).trim() : "";
+                if (TextUtils.isEmpty(accountName)) accountName = "默认账户"; // 飞鸭中可能为空
+
+                int matchedId = matchAssetId(accountName, allAssets);
+                if (matchedId == 0 && !TextUtils.isEmpty(accountName)) {
+                    if (newAssetMap.containsKey(accountName)) {
+                        t.assetId = newAssetMap.get(accountName);
+                    } else {
+                        maxAssetId++;
+                        AssetAccount newAsset = new AssetAccount(accountName, 0.0, 0);
+                        newAsset.id = maxAssetId;
+                        newAssetsToCreate.add(newAsset);
+                        newAssetMap.put(accountName, maxAssetId);
+                        t.assetId = maxAssetId;
+                    }
+                } else {
+                    t.assetId = matchedId;
+                }
+
+                transactions.add(t);
+            }
+        }
+
+        BackupData result = new BackupData(transactions, newAssetsToCreate);
+        result.expenseCategories = expCats;
+        result.incomeCategories = incCats;
+        result.subCategoryMap = subCatMap;
+        return result;
+    }
+
+    // ============================================================================================
+    // 咔皮记账账单导入 (支持 xlsx)
+    // ============================================================================================
+    public static BackupData importFromKapi(Context context, Uri uri, List<AssetAccount> allAssets) throws Exception {
+        List<Transaction> transactions = new ArrayList<>();
+        List<AssetAccount> newAssetsToCreate = new ArrayList<>();
+        Map<String, Integer> newAssetMap = new HashMap<>();
+
+        List<String> expCats = new ArrayList<>(CategoryManager.getExpenseCategories(context));
+        List<String> incCats = new ArrayList<>(CategoryManager.getIncomeCategories(context));
+        Map<String, List<String>> subCatMap = new HashMap<>();
+
+        int maxAssetId = 0;
+        if (allAssets != null) {
+            for (AssetAccount a : allAssets) {
+                if (a.id > maxAssetId) maxAssetId = a.id;
+            }
+        }
+
+        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
+             Workbook workbook = WorkbookFactory.create(inputStream)) {
+
+            Sheet sheet = workbook.getSheetAt(0);
+            boolean isDataSection = false;
+
+            // 咔皮记账的日期和时间可能是分开的，需要合并解析
+            SimpleDateFormat parserSdf = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.getDefault());
+            SimpleDateFormat noteSdf = new SimpleDateFormat("MM-dd HH:mm", Locale.getDefault());
+
+            int dateIdx = -1, timeIdx = -1, typeIdx = -1, amountIdx = -1, catIdx = -1, subCatIdx = -1, accountIdx = -1, remarkIdx = -1;
+
+            for (Row row : sheet) {
+                if (row == null) continue;
+
+                if (!isDataSection) {
+                    String firstCell = getCellText(row.getCell(0));
+                    if (firstCell.contains("日期") || firstCell.contains("收支")) {
+                        isDataSection = true;
+                        for (int i = 0; i < row.getLastCellNum(); i++) {
+                            String h = getCellText(row.getCell(i)).trim();
+                            if ("日期".equals(h)) dateIdx = i;
+                            else if ("时间".equals(h)) timeIdx = i;
+                            else if ("类型".equals(h) || "收支类型".equals(h)) typeIdx = i;
+                            else if ("金额".equals(h)) amountIdx = i;
+                            else if ("一级分类".equals(h) || "分类".equals(h)) catIdx = i;
+                            else if ("二级分类".equals(h) || "子分类".equals(h)) subCatIdx = i;
+                            else if ("账户".equals(h)) accountIdx = i;
+                            else if ("备注".equals(h)) remarkIdx = i;
+                        }
+                    }
+                    continue;
+                }
+
+                // 核心必填列
+                if (dateIdx == -1 || amountIdx == -1) continue;
+
+                String dateStr = getCellText(row.getCell(dateIdx)).trim();
+                if (TextUtils.isEmpty(dateStr)) continue;
+
+                String timeStr = (timeIdx != -1) ? getCellText(row.getCell(timeIdx)).trim() : "00:00:00";
+
+                Transaction t = new Transaction();
+
+                // 1. 类型映射
+                String typeStr = (typeIdx != -1) ? getCellText(row.getCell(typeIdx)).trim() : "";
+                t.type = "收入".equals(typeStr) ? 1 : 0;
+
+                // 2. 金额映射
+                t.amount = Math.abs(parseDoubleSafe(getCellText(row.getCell(amountIdx))));
+
+                // 3. 时间与记录标识映射
+                // 兼容带斜杠或带横杠的日期格式
+                String cleanDateStr = dateStr.replace("/", "-");
+                String combinedDateTime = cleanDateStr + " " + timeStr;
+
+                Date dateObj = null;
+                SimpleDateFormat parserSdf1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
+                SimpleDateFormat parserSdf2 = new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault());
+
+                try {
+                    // 先尝试带秒的格式
+                    dateObj = parserSdf1.parse(combinedDateTime);
+                } catch (Exception e) {
+                    try {
+                        // 如果失败，尝试不带秒的格式
+                        dateObj = parserSdf2.parse(combinedDateTime);
+                    } catch (Exception e2) {
+                        // ignore
+                    }
+                }
+
+                // 如果解析成功使用真实时间，失败则作为兜底使用当前时间
+                if (dateObj != null) {
+                    t.date = dateObj.getTime();
+                } else {
+                    dateObj = new Date();
+                    t.date = dateObj.getTime();
+                }
+
+                // 提取备注并拼装记录标识
+                String remark = (remarkIdx != -1) ? getCellText(row.getCell(remarkIdx)).trim() : "";
+                t.remark = "";
+
+                // 统一策略：没有备注只保留时间，有备注则加上空格和备注
+                if (TextUtils.isEmpty(remark)) {
+                    t.note = noteSdf.format(dateObj);
+                } else {
+                    t.note = noteSdf.format(dateObj) + " " + remark;
+                }
+
+                // 4. 分类映射
+                String category = (catIdx != -1) ? getCellText(row.getCell(catIdx)).trim() : "";
+                if (TextUtils.isEmpty(category)) category = "其它";
+                String subCategory = (subCatIdx != -1) ? getCellText(row.getCell(subCatIdx)).trim() : "";
+
+                List<String> targetList = (t.type == 1) ? incCats : expCats;
+                if (!targetList.contains(category)) targetList.add(category);
+
+                if (!TextUtils.isEmpty(subCategory)) {
+                    List<String> subs = subCatMap.get(category);
+                    if (subs == null) {
+                        subs = new ArrayList<>(CategoryManager.getSubCategories(context, category));
+                        subCatMap.put(category, subs);
+                    }
+                    if (!subs.contains(subCategory)) subs.add(subCategory);
+                }
+                t.category = category;
+                t.subCategory = subCategory;
+
+                // 5. 账户映射
+                String accountName = (accountIdx != -1) ? getCellText(row.getCell(accountIdx)).trim() : "默认账户";
+                if (TextUtils.isEmpty(accountName)) accountName = "默认账户";
+
+                int matchedId = matchAssetId(accountName, allAssets);
+                if (matchedId == 0) {
+                    if (newAssetMap.containsKey(accountName)) {
+                        t.assetId = newAssetMap.get(accountName);
+                    } else {
+                        maxAssetId++;
+                        AssetAccount newAsset = new AssetAccount(accountName, 0.0, 0);
+                        newAsset.id = maxAssetId;
+                        newAssetsToCreate.add(newAsset);
+                        newAssetMap.put(accountName, maxAssetId);
+                        t.assetId = maxAssetId;
+                    }
+                } else {
+                    t.assetId = matchedId;
+                }
+
+                transactions.add(t);
+            }
+        }
+
+        BackupData data = new BackupData(transactions, newAssetsToCreate);
+        data.expenseCategories = expCats;
+        data.incomeCategories = incCats;
+        data.subCategoryMap = subCatMap;
+        return data;
+    }
+
+    // ============================================================================================
+    // 小青账账单导入 (支持 CSV)
+    // ============================================================================================
+    // 1. 公开的入口方法：负责双重编码尝试
+    public static BackupData importFromXiaoqing(Context context, Uri uri, List<AssetAccount> allAssets) throws Exception {
+        // 第一次尝试：使用 GBK (ANSI) 编码解析
+        BackupData data = parseXiaoqingCsvWithEncoding(context, uri, "GBK", allAssets);
+
+        // 如果解析出来的记录为空，说明编码可能不对，第二次尝试：使用 UTF-8
+        if (data.records == null || data.records.isEmpty()) {
+            data = parseXiaoqingCsvWithEncoding(context, uri, "UTF-8", allAssets);
+        }
+        return data;
+    }
+
+    // 2. 私有的核心解析方法：注意这里的参数列表必须包含 String charsetName
+    private static BackupData parseXiaoqingCsvWithEncoding(Context context, Uri uri, String charsetName, List<AssetAccount> allAssets) throws Exception {
+        List<Transaction> transactions = new ArrayList<>();
+        List<AssetAccount> newAssetsToCreate = new ArrayList<>();
+        Map<String, Integer> newAssetMap = new HashMap<>();
+
+        // 获取分类配置
+        List<String> expCats = new ArrayList<>(CategoryManager.getExpenseCategories(context));
+        List<String> incCats = new ArrayList<>(CategoryManager.getIncomeCategories(context));
+        Map<String, List<String>> subCatMap = new HashMap<>();
+
+        int maxAssetId = 0;
+        if (allAssets != null) {
+            for (AssetAccount a : allAssets) {
+                if (a.id > maxAssetId) maxAssetId = a.id;
+            }
+        }
+
+        // 注意：这里的 charsetName 来源于方法参数
+        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
+             BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, charsetName))) {
+
+            String line;
+            boolean isDataSection = false;
+            // 小青账日期格式: 2026-4-17 16:57
+            SimpleDateFormat parserSdf = new SimpleDateFormat("yyyy-M-d H:m", Locale.getDefault());
+            SimpleDateFormat noteSdf = new SimpleDateFormat("MM-dd HH:mm", Locale.getDefault());
+
+            int typeIdx = -1, amtIdx = -1, catIdx = -1, subCatIdx = -1, dateIdx = -1, remarkIdx = -1, accIdx = -1;
+
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("\ufeff")) line = line.substring(1);
+                if (TextUtils.isEmpty(line.trim())) continue;
+
+                // 识别表头
+                if (!isDataSection && line.contains("收支类型") && line.contains("记账日期")) {
+                    isDataSection = true;
+                    List<String> headers = parseCsvLine(line);
+                    for (int i = 0; i < headers.size(); i++) {
+                        String h = headers.get(i).trim();
+                        if ("收支类型".equals(h)) typeIdx = i;
+                        else if ("金额".equals(h)) amtIdx = i;
+                        else if ("分类".equals(h)) catIdx = i;
+                        else if ("子分类".equals(h)) subCatIdx = i;
+                        else if ("记账日期".equals(h)) dateIdx = i;
+                        else if ("备注信息".equals(h)) remarkIdx = i;
+                        else if ("账户名称".equals(h)) accIdx = i;
+                    }
+                    continue;
+                }
+
+                if (!isDataSection) continue;
+
+                List<String> tokens = parseCsvLine(line);
+                // 确保索引有效
+                if (tokens.size() <= Math.max(dateIdx, amtIdx)) continue;
+
+                Transaction t = new Transaction();
+
+                // 类型与金额
+                t.type = "收入".equals(tokens.get(typeIdx).trim()) ? 1 : 0;
+                t.amount = Math.abs(parseDoubleSafe(tokens.get(amtIdx).trim()));
+
+                // 时间与标识
+                String dateStr = tokens.get(dateIdx).trim();
+                Date dateObj;
+                try {
+                    dateObj = parserSdf.parse(dateStr);
+                    t.date = (dateObj != null) ? dateObj.getTime() : System.currentTimeMillis();
+                } catch (Exception e) {
+                    dateObj = new Date();
+                    t.date = dateObj.getTime();
+                }
+
+                // 提取备注并拼装记录标识
+                String remark = (remarkIdx != -1 && remarkIdx < tokens.size()) ? tokens.get(remarkIdx).trim() : "";
+                t.remark = "";
+
+                // 统一策略：没有备注只保留时间，有备注则加上空格和备注
+                if (TextUtils.isEmpty(remark)) {
+                    t.note = noteSdf.format(dateObj);
+                } else {
+                    t.note = noteSdf.format(dateObj) + " " + remark;
+                }
+                // 分类与账户逻辑
+                String category = tokens.get(catIdx).trim();
+                if (TextUtils.isEmpty(category)) category = "其它";
+                String subCategory = (subCatIdx != -1 && subCatIdx < tokens.size()) ? tokens.get(subCatIdx).trim() : "";
+
+                List<String> targetList = (t.type == 1) ? incCats : expCats;
+                if (!targetList.contains(category)) targetList.add(category);
+                if (!TextUtils.isEmpty(subCategory)) {
+                    List<String> subs = subCatMap.get(category);
+                    if (subs == null) {
+                        subs = new ArrayList<>(CategoryManager.getSubCategories(context, category));
+                        subCatMap.put(category, subs);
+                    }
+                    if (!subs.contains(subCategory)) subs.add(subCategory);
+                }
+                t.category = category; t.subCategory = subCategory;
+
+                String accountName = (accIdx != -1 && accIdx < tokens.size()) ? tokens.get(accIdx).trim() : "默认账户";
+                int matchedId = matchAssetId(accountName, allAssets);
+                if (matchedId == 0 && !TextUtils.isEmpty(accountName)) {
+                    if (newAssetMap.containsKey(accountName)) { t.assetId = newAssetMap.get(accountName); }
+                    else {
+                        maxAssetId++; AssetAccount na = new AssetAccount(accountName, 0.0, 0);
+                        na.id = maxAssetId; newAssetsToCreate.add(na);
+                        newAssetMap.put(accountName, maxAssetId); t.assetId = maxAssetId;
+                    }
+                } else { t.assetId = matchedId; }
+                transactions.add(t);
+            }
+        }
+
+        BackupData result = new BackupData(transactions, newAssetsToCreate);
+        result.expenseCategories = expCats;
+        result.incomeCategories = incCats;
+        result.subCategoryMap = subCatMap;
+        return result;
+    }
+
+    // ============================================================================================
+    // 蜜蜂记账账单导入 (支持 CSV)
+    // ============================================================================================
+    public static BackupData importFromBeeCount(Context context, Uri uri, List<AssetAccount> allAssets) throws Exception {
+        // 先尝试 GBK 解析，失败或为空再尝试 UTF-8 编码
+        BackupData data = parseBeeCountCsvWithEncoding(context, uri, "GBK", allAssets);
+        if (data.records.isEmpty()) {
+            data = parseBeeCountCsvWithEncoding(context, uri, "UTF-8", allAssets);
+        }
+        return data;
+    }
+
+    private static BackupData parseBeeCountCsvWithEncoding(Context context, Uri uri, String charsetName, List<AssetAccount> allAssets) throws Exception {
+        List<Transaction> transactions = new ArrayList<>();
+        List<AssetAccount> newAssetsToCreate = new ArrayList<>();
+        Map<String, Integer> newAssetMap = new HashMap<>();
+
+        List<String> expCats = new ArrayList<>(CategoryManager.getExpenseCategories(context));
+        List<String> incCats = new ArrayList<>(CategoryManager.getIncomeCategories(context));
+        Map<String, List<String>> subCatMap = new HashMap<>();
+
+        for (String cat : expCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, cat);
+            if (subs != null && !subs.isEmpty()) subCatMap.put(cat, subs);
+        }
+        for (String cat : incCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, cat);
+            if (subs != null && !subs.isEmpty()) subCatMap.put(cat, subs);
+        }
+
+        int maxAssetId = 0;
+        if (allAssets != null) {
+            for (AssetAccount a : allAssets) {
+                if (a.id > maxAssetId) maxAssetId = a.id;
+            }
+        }
+
+        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
+             BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, charsetName))) {
+
+            String line;
+            boolean isDataSection = false;
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
+            // 【新增】用于格式化记录标识的时间部分
+            SimpleDateFormat noteSdf = new SimpleDateFormat("MM-dd HH:mm", Locale.getDefault());
+
+            int typeIdx = -1, catIdx = -1, subCatIdx = -1, amountIdx = -1, accountIdx = -1, remarkIdx = -1, timeIdx = -1;
+
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("\ufeff")) line = line.substring(1); // 过滤 BOM
+                if (TextUtils.isEmpty(line.trim())) continue;
+
+                // 识别表头行，蜜蜂记账一般包含这些关键字段
+                if (!isDataSection && line.contains("类型") && line.contains("分类") && line.contains("金额")) {
+                    isDataSection = true;
+                    List<String> headers = parseCsvLine(line);
+                    for (int i = 0; i < headers.size(); i++) {
+                        String h = headers.get(i).trim();
+                        if ("类型".equals(h)) typeIdx = i;
+                        else if ("分类".equals(h)) catIdx = i;
+                        else if ("二级分类".equals(h)) subCatIdx = i;
+                        else if ("金额".equals(h)) amountIdx = i;
+                        else if ("账户".equals(h)) accountIdx = i;
+                        else if ("备注".equals(h)) remarkIdx = i;
+                        else if ("时间".equals(h)) timeIdx = i;
+                    }
+                    continue;
+                }
+
+                if (!isDataSection) continue;
+
+                List<String> tokens = parseCsvLine(line);
+                int maxRequiredIdx = Math.max(Math.max(typeIdx, catIdx), Math.max(amountIdx, timeIdx));
+
+                // 列不足直接跳过
+                if (typeIdx == -1 || catIdx == -1 || amountIdx == -1 || timeIdx == -1 || tokens.size() <= maxRequiredIdx) {
+                    continue;
+                }
+
+                Transaction t = new Transaction();
+
+                // 1. 类型映射
+                String typeStr = tokens.get(typeIdx).trim();
+                if ("收入".equals(typeStr)) {
+                    t.type = 1;
+                } else if ("支出".equals(typeStr)) {
+                    t.type = 0;
+                } else {
+                    t.type = 0; // 默认或者其他状态当作支出处理
+                }
+
+                // 2. 金额映射
+                String amountStr = tokens.get(amountIdx).replace("¥", "").replace(",", "").trim();
+                t.amount = Math.abs(parseDoubleSafe(amountStr));
+
+                // 3. 时间与记录标识、备注的统一映射
+                String timeStr = tokens.get(timeIdx).trim();
+                Date dateObj = null;
+                try {
+                    dateObj = sdf.parse(timeStr);
+                    t.date = (dateObj != null) ? dateObj.getTime() : System.currentTimeMillis();
+                } catch (Exception e) {
+                    t.date = System.currentTimeMillis();
+                    dateObj = new Date(t.date); // 兜底使用当前时间
+                }
+
+                // 提取原账单备注用于拼装记录标识
+                String parsedRemark = (remarkIdx != -1 && remarkIdx < tokens.size()) ? tokens.get(remarkIdx).trim() : "";
+
+                // 原生备注字段直接留空，保持界面清爽
+                t.remark = "";
+
+                // 将提取出的备注拼接到记录标识 (note) 的时间后面
+                if (TextUtils.isEmpty(parsedRemark)) {
+                    t.note = noteSdf.format(dateObj); // 没有备注，仅保留时间 "MM-dd HH:mm"
+                } else {
+                    t.note = noteSdf.format(dateObj) + " " + parsedRemark; // 有备注，拼接空格
+                }
+
+                // 5. 分类和二级分类映射 (不存在则自动生成)
+                String category = tokens.get(catIdx).trim();
+                String subCategory = (subCatIdx != -1 && subCatIdx < tokens.size()) ? tokens.get(subCatIdx).trim() : "";
+
+                if (TextUtils.isEmpty(category)) category = "其它";
+
+                // 分类判断并新增
+                List<String> targetList = (t.type == 1) ? incCats : expCats;
+                if (!targetList.contains(category)) {
+                    targetList.add(category);
+                }
+
+                // 二级分类判断并新增
+                if (!TextUtils.isEmpty(subCategory)) {
+                    List<String> subs = subCatMap.get(category);
+                    if (subs == null) {
+                        subs = new ArrayList<>();
+                        subCatMap.put(category, subs);
+                    }
+                    if (!subs.contains(subCategory)) {
+                        subs.add(subCategory);
+                    }
+                }
+
+                t.category = category;
+                t.subCategory = subCategory;
+
+                // 6. 账户映射 (如果不匹配则新建)
+                String accountName = (accountIdx != -1 && accountIdx < tokens.size()) ? tokens.get(accountIdx).trim() : "";
+                int matchedId = matchAssetId(accountName, allAssets);
+
+                if (matchedId == 0 && !TextUtils.isEmpty(accountName) && !"/".equals(accountName)) {
+                    if (newAssetMap.containsKey(accountName)) {
+                        t.assetId = newAssetMap.get(accountName);
+                    } else {
+                        maxAssetId++;
+                        int newId = maxAssetId;
+                        AssetAccount newAsset = new AssetAccount(accountName, 0.0, 0); // 默认为普通资产类型
+                        newAsset.id = newId;
+                        newAssetsToCreate.add(newAsset);
+                        newAssetMap.put(accountName, newId);
+                        t.assetId = newId;
+                    }
+                } else {
+                    t.assetId = matchedId;
+                }
+
+                transactions.add(t);
+            }
+        }
+
+        BackupData data = new BackupData(transactions, newAssetsToCreate);
+        data.expenseCategories = expCats;
+        data.incomeCategories = incCats;
+        data.subCategoryMap = subCatMap; // 返回带新增子分类的列表
+        return data;
+    }
+    public static BackupData importFromZip(Context context, Uri uri) throws Exception {
+         try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
+             ZipInputStream zis = new ZipInputStream(inputStream)) {
+
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (entry.getName().equals(JSON_FILE_NAME)) {
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(zis, StandardCharsets.UTF_8));
+                    StringBuilder sb = new StringBuilder();
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        sb.append(line);
+                    }
+                    Gson gson = new Gson();
+                    BackupData data = gson.fromJson(sb.toString(), BackupData.class);
+
+                    if (data.autoAssetRules != null && !data.autoAssetRules.isEmpty()) {
+                         for (String ruleStr : data.autoAssetRules) {
+                            AutoAssetManager.AssetRule rule = AutoAssetManager.AssetRule.fromString(ruleStr);
+                            if (rule != null) {
+                                AutoAssetManager.addRule(context, rule);
+                            }
+                        }
+                    }
+
+                    if (data.assistantConfig != null) {
+                        restoreAssistantConfig(context, data.assistantConfig);
+                    }
+
+                    if (data.subCategoryMap != null) {
+                        for (Map.Entry<String, List<String>> entryMap : data.subCategoryMap.entrySet()) {
+                            CategoryManager.saveSubCategories(context, entryMap.getKey(), entryMap.getValue());
+                        }
+                    }
+
+                    // 【新增】恢复自动续费列表
+                    if (data.renewalList != null) {
+                        new AssistantConfig(context).saveRenewalList(data.renewalList);
+                    }
+
+                    // 【周期记账】恢复周期记账规则
+                    if (data.recurringRules != null && !data.recurringRules.isEmpty()) {
+                        AppDatabase db = AppDatabase.getDatabase(context);
+                        for (com.example.budgetapp.database.RecurringRule rule : data.recurringRules) {
+                            rule.id = 0; // 重置ID让数据库自动分配
+                            db.recurringRuleDao().insert(rule);
+                        }
+                    }
+
+                    // 【修复】按照原数据类型恢复，防止类型转换异常崩溃
+                    if (data.appPreferences != null) {
+                        SharedPreferences.Editor editor = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE).edit();
+                        for (Map.Entry<String, BackupData.PrefItem> entryMap : data.appPreferences.entrySet()) {
+                            String key = entryMap.getKey();
+                            BackupData.PrefItem item = entryMap.getValue();
+                            if (item == null || item.value == null) continue;
+                            try {
+                                switch (item.type) {
+                                    case "Boolean": editor.putBoolean(key, Boolean.parseBoolean(item.value)); break;
+                                    case "Integer": editor.putInt(key, Integer.parseInt(item.value)); break;
+                                    case "Float": editor.putFloat(key, Float.parseFloat(item.value)); break;
+                                    case "Long": editor.putLong(key, Long.parseLong(item.value)); break;
+                                    default: editor.putString(key, item.value); break;
+                                }
+                            } catch (Exception e) {
+                                Log.e("BackupManager", "恢复配置异常", e);
+                            }
+                        }
+                        editor.apply();
+                    }
+
+                    return data;
+                }
+            }
+        }
+        throw new Exception("无法识别的备份文件：未找到数据文件 " + JSON_FILE_NAME);
+    }
+
+    // ============================================================================================
+    // Excel (CSV) 导出/导入
+    // ============================================================================================
+
+    public static void exportToExcel(Context context, Uri uri, List<Transaction> transactions, List<AssetAccount> assets) throws Exception {
+        if (transactions == null) transactions = new ArrayList<>();
+        if (assets == null) assets = new ArrayList<>();
+
+        Map<Integer, String> assetMap = new HashMap<>();
+        for (AssetAccount asset : assets) {
+            assetMap.put(asset.id, asset.name);
+        }
+
+        StringBuilder csvBuilder = new StringBuilder();
+        csvBuilder.append('\ufeff'); // BOM
+
+        // 【修改】写入顺序：先写配置数据，最后写交易记录
+
+        // -------------------------
+        // 1. 资产列表 (原第2部分，现移至第1)
+        // -------------------------
+        csvBuilder.append("=== 资产账户列表 ===\n");
+        // 【修改】加入 "计入总资产" 和 "图标"
+        csvBuilder.append("ID,账户名称,余额,类型,币种,计入总资产,图标,资产分类\n");
+        for (AssetAccount asset : assets) {
+            csvBuilder.append(asset.id).append(",");
+            csvBuilder.append(escapeCsv(asset.name)).append(",");
+            csvBuilder.append(asset.amount).append(",");
+            String assetTypeStr;
+            switch (asset.type) {
+                case 1: assetTypeStr = "负债"; break;
+                case 2: assetTypeStr = "借出"; break;
+                default: assetTypeStr = "资产"; break;
+            }
+            csvBuilder.append(assetTypeStr).append(",");
+            String symbol = (asset.currencySymbol == null) ? "¥" : asset.currencySymbol;
+            csvBuilder.append(escapeCsv(symbol)).append(",");
+            csvBuilder.append(asset.isIncludedInTotal).append(",");
+            csvBuilder.append(escapeCsv(asset.svgIcon == null ? "" : asset.svgIcon)).append(",");
+            csvBuilder.append(escapeCsv(asset.assetCategory == null ? "" : asset.assetCategory)).append("\n");
+        }
+        csvBuilder.append("\n\n");
+
+        // -------------------------
+        // 2. 分类预设
+        // -------------------------
+        csvBuilder.append("=== 分类预设配置 ===\n");
+        csvBuilder.append("分类类型,分类名称\n");
+        List<String> expenseCategories = CategoryManager.getExpenseCategories(context);
+        for (String category : expenseCategories) {
+            csvBuilder.append("支出,").append(escapeCsv(category)).append("\n");
+        }
+        List<String> incomeCategories = CategoryManager.getIncomeCategories(context);
+        for (String category : incomeCategories) {
+            csvBuilder.append("收入,").append(escapeCsv(category)).append("\n");
+        }
+        csvBuilder.append("\n\n");
+
+        // -------------------------
+        // 3. 二级分类配置
+        // -------------------------
+        csvBuilder.append("=== 二级分类配置 ===\n");
+        csvBuilder.append("一级分类,二级分类列表\n");
+        List<String> allCats = new ArrayList<>(expenseCategories);
+        allCats.addAll(incomeCategories);
+        for (String parent : allCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, parent);
+            if (subs != null && !subs.isEmpty()) {
+                csvBuilder.append(escapeCsv(parent)).append(",")
+                          .append(escapeCsv(TextUtils.join("|", subs))).append("\n");
+            }
+        }
+        csvBuilder.append("\n\n");
+
+        // -------------------------
+        // 4. 记账助手配置
+        // -------------------------
+        csvBuilder.append("=== 记账助手配置 ===\n");
+        csvBuilder.append("配置项,值\n");
+        AssistantConfig config = new AssistantConfig(context);
+        csvBuilder.append("自动记账开关,").append(config.isEnabled()).append("\n");
+//        csvBuilder.append("退款监听,").append(config.isRefundEnabled()).append("\n");
+        csvBuilder.append("资产模块,").append(config.isAssetsEnabled()).append("\n");
+        csvBuilder.append("默认资产ID,").append(config.getDefaultAssetId()).append("\n");
+        csvBuilder.append("工作日加班倍率,").append(config.getWeekdayOvertimeRate()).append("\n");
+        csvBuilder.append("节假日加班倍率,").append(config.getHolidayOvertimeRate()).append("\n");
+        csvBuilder.append("月薪底薪,").append(config.getMonthlyBaseSalary()).append("\n");
+        csvBuilder.append("支出关键字,").append(escapeCsv(joinSet(config.getExpenseKeywords()))).append("\n");
+        csvBuilder.append("收入关键字,").append(escapeCsv(joinSet(config.getIncomeKeywords()))).append("\n");
+        csvBuilder.append("\n\n");
+
+        // -------------------------
+        // 5. 自动资产规则
+        // -------------------------
+        csvBuilder.append("=== 自动资产规则 ===\n");
+        csvBuilder.append("应用包名,关键字,绑定资产ID\n");
+        List<AutoAssetManager.AssetRule> rules = AutoAssetManager.getRules(context);
+        for (AutoAssetManager.AssetRule rule : rules) {
+            csvBuilder.append(escapeCsv(rule.packageName)).append(",");
+            csvBuilder.append(escapeCsv(rule.keyword)).append(",");
+            csvBuilder.append(rule.assetId).append("\n");
+        }
+        csvBuilder.append("\n\n");
+
+        // -------------------------
+        // 6. 应用偏好设置 (找到这部分，加入类型列)
+        // -------------------------
+        csvBuilder.append("=== 应用偏好设置 ===\n");
+        csvBuilder.append("键,类型,值\n"); // 【修复】增加"类型"列
+        SharedPreferences prefs = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE);
+        for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
+            Object val = entry.getValue();
+            if (val == null) continue;
+            String type = val.getClass().getSimpleName();
+            csvBuilder.append(escapeCsv(entry.getKey())).append(",")
+                    .append(escapeCsv(type)).append(",")
+                    .append(escapeCsv(String.valueOf(val))).append("\n");
+        }
+        csvBuilder.append("\n\n");
+
+        // -------------------------
+        // 7. 自动续费设置【新增】
+        // -------------------------
+        csvBuilder.append("=== 自动续费设置 ===\n");
+        csvBuilder.append("JSON数据\n");
+        List<RenewalItem> renewals = new AssistantConfig(context).getRenewalList();
+        for (RenewalItem item : renewals) {
+            csvBuilder.append(escapeCsv(item.toJson())).append("\n");
+        }
+        csvBuilder.append("\n\n");
+
+        // -------------------------
+        // 8. 交易记录
+        // -------------------------
+        csvBuilder.append("=== 交易记录 ===\n");
+        // 【修改】加入币种
+        csvBuilder.append("交易ID,时间,类型,分类,金额,资产账户,记录标识,备注,二级分类,币种\n");
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy年MM月dd日", Locale.CHINA);
+
+        for (Transaction t : transactions) {
+            csvBuilder.append(t.id).append(",");
+            csvBuilder.append(sdf.format(new Date(t.date))).append(",");
+            String typeStr = (t.type == 0) ? "支出" : (t.type == 1 ? "收入" : "其他");
+            csvBuilder.append(typeStr).append(",");
+            csvBuilder.append(escapeCsv(t.category)).append(",");
+            csvBuilder.append(t.amount).append(",");
+            String assetName = assetMap.get(t.assetId);
+            if (assetName == null) assetName = "未知账户";
+            csvBuilder.append(escapeCsv(assetName)).append(",");
+            csvBuilder.append(escapeCsv(t.note)).append(",");
+            csvBuilder.append(escapeCsv(t.remark)).append(",");
+            csvBuilder.append(escapeCsv(t.subCategory)).append(",");
+            String currency = (t.currencySymbol == null) ? "¥" : t.currencySymbol;
+            csvBuilder.append(escapeCsv(currency)).append("\n"); // 【新增】多币种支持
+        }
+
+        try (OutputStream outputStream = context.getContentResolver().openOutputStream(uri)) {
+            outputStream.write(csvBuilder.toString().getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    public static BackupData importFromExcel(Context context, Uri uri) throws Exception {
+        List<String> lines = new ArrayList<>();
+        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
+             BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                lines.add(line);
+            }
+        }
+
+        if (lines.isEmpty()) {
+            throw new Exception("文件内容为空");
+        }
+
+        if (lines.get(0).startsWith("\ufeff")) {
+            lines.set(0, lines.get(0).substring(1));
+        }
+
+        List<Transaction> transactions = new ArrayList<>();
+        List<AssetAccount> assets = new ArrayList<>();
+        List<String> expenseCats = new ArrayList<>();
+        List<String> incomeCats = new ArrayList<>();
+        
+        List<List<String>> transactionRows = new ArrayList<>();
+        List<List<String>> assetRows = new ArrayList<>();
+        List<List<String>> categoryRows = new ArrayList<>();
+        List<List<String>> assistantRows = new ArrayList<>(); 
+        List<List<String>> ruleRows = new ArrayList<>();
+        List<List<String>> subCategoryRows = new ArrayList<>();
+        List<List<String>> appPrefsRows = new ArrayList<>(); // 【新增】
+        List<List<String>> renewalRows = new ArrayList<>(); // 【新增】
+
+
+        // 默认状态：0=交易, 1=资产, 2=分类, 3=助手, 4=规则, 5=二级分类
+        // 如果没有明确Header（旧版备份），默认认为是交易记录
+        int currentSection = 0; 
+
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (TextUtils.isEmpty(trimmed)) continue;
+
+            // 检测区块头
+            if (trimmed.contains("=== 交易记录 ===")) { // 新增检测
+                currentSection = 0; continue;
+            } else if (trimmed.contains("=== 资产账户列表 ===")) {
+                currentSection = 1; continue;
+            } else if (trimmed.contains("=== 分类预设配置 ===")) {
+                currentSection = 2; continue;
+            } else if (trimmed.contains("=== 二级分类配置 ===")) {
+                currentSection = 5; continue;
+            } else if (trimmed.contains("=== 记账助手配置 ===")) {
+                currentSection = 3; continue;
+            } else if (trimmed.contains("=== 自动资产规则 ===")) {
+                currentSection = 4; continue;
+            }  else if (trimmed.contains("=== 应用偏好设置 ===")) { // 【新增】
+                currentSection = 6; continue;
+            } else if (trimmed.contains("=== 自动续费设置 ===")) { // 【新增】
+                currentSection = 7; continue;
+            } else if (trimmed.startsWith("交易ID,") || trimmed.startsWith("ID,")
+                    || trimmed.startsWith("分类类型,") || trimmed.startsWith("配置项,")
+                    || trimmed.startsWith("应用包名,") || trimmed.startsWith("一级分类,")) {
+                // 跳过表头
+                continue;
+            }
+
+            List<String> tokens = parseCsvLine(line);
+            if (tokens.isEmpty()) continue;
+
+            if (currentSection == 0) transactionRows.add(tokens);
+            else if (currentSection == 1) assetRows.add(tokens);
+            else if (currentSection == 2) categoryRows.add(tokens);
+            else if (currentSection == 3) assistantRows.add(tokens);
+            else if (currentSection == 4) ruleRows.add(tokens);
+            else if (currentSection == 5) subCategoryRows.add(tokens);
+            else if (currentSection == 6) appPrefsRows.add(tokens); // 【新增】
+            else if (currentSection == 7) renewalRows.add(tokens); // 【新增】
+        }
+
+        // 解析资产 (ID映射)
+        Map<String, Integer> assetNameToIdMap = new HashMap<>();
+        for (List<String> row : assetRows) {
+            if (row.size() < 2) continue;
+            try {
+                int id = Integer.parseInt(row.get(0));
+                String name = row.get(1);
+                double amount = parseDoubleSafe(row.size() > 2 ? row.get(2) : "0");
+                String typeStr = row.size() > 3 ? row.get(3) : "资产";
+                String symbol = row.size() > 4 ? row.get(4) : "¥";
+
+                // 【必须加上这一行】声明 included 变量，读取 Excel 第6列(索引为5)的数据
+                boolean included = row.size() <= 5 || Boolean.parseBoolean(row.get(5));
+
+                int type = 0;
+                if ("负债".equals(typeStr)) type = 1;
+                else if ("借出".equals(typeStr)) type = 2;
+                AssetAccount asset = new AssetAccount(name, amount, type);
+                asset.id = id;
+                asset.currencySymbol = symbol;
+                asset.svgIcon = row.size() > 6 ? row.get(6) : "";
+                asset.assetCategory = row.size() > 7 ? row.get(7) : "";
+                asset.isIncludedInTotal = included; // 【新增】计入总资产
+                assets.add(asset);
+                assetNameToIdMap.put(name, id);
+            } catch (Exception e) {
+                Log.e("BackupManager", "解析资产行失败", e);
+            }
+        }
+
+        // 解析交易
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy年MM月dd日", Locale.CHINA);
+        for (List<String> row : transactionRows) {
+            // 至少要有到金额的列
+            if (row.size() < 5) continue;
+            try {
+                Transaction t = new Transaction();
+                try { t.id = Integer.parseInt(row.get(0)); } catch (Exception e) { t.id = 0; }
+                Date date = sdf.parse(row.get(1));
+                t.date = (date != null) ? date.getTime() : System.currentTimeMillis();
+                String typeStr = row.get(2);
+                t.type = "收入".equals(typeStr) ? 1 : ("支出".equals(typeStr) ? 0 : 2);
+                t.category = row.get(3);
+                t.amount = parseDoubleSafe(row.get(4));
+                String assetName = (row.size() > 5) ? row.get(5) : "";
+                t.assetId = assetNameToIdMap.containsKey(assetName) ? assetNameToIdMap.get(assetName) : 0;
+                t.note = (row.size() > 6) ? row.get(6) : "";
+                t.remark = (row.size() > 7) ? row.get(7) : "";
+                t.subCategory = (row.size() > 8) ? row.get(8) : "";
+                t.currencySymbol = (row.size() > 9) ? row.get(9) : "¥"; // 【新增】恢复多币种
+                transactions.add(t);
+            } catch (Exception e) {
+                Log.e("BackupManager", "解析交易行失败", e);
+            }
+        }
+
+        // 【修复】按照带类型的三列格式恢复配置。如果是旧版两列格式，则进行智能数据类型推断
+        SharedPreferences.Editor editor = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE).edit();
+        for (List<String> row : appPrefsRows) {
+            if (row.size() < 2) continue;
+
+            String key = row.get(0);
+
+            // 兼容旧版本：只有「键、值」两列的情况
+            if (row.size() == 2) {
+                String val = row.get(1);
+                if ("true".equalsIgnoreCase(val) || "false".equalsIgnoreCase(val)) {
+                    editor.putBoolean(key, Boolean.parseBoolean(val));
+                } else if (val.matches("-?\\d+")) {
+                    // 纯整数（识别 Int 或 Long，比如 budget_start_time 是个极大的 Long 时间戳）
+                    try {
+                        long longVal = Long.parseLong(val);
+                        if (longVal >= Integer.MIN_VALUE && longVal <= Integer.MAX_VALUE) {
+                            editor.putInt(key, (int) longVal);
+                        } else {
+                            editor.putLong(key, longVal);
+                        }
+                    } catch (NumberFormatException e) {
+                        editor.putString(key, val);
+                    }
+                } else if (val.matches("-?\\d+\\.\\d+")) {
+                    // 浮点数（识别 Float，比如 budget_cat_交通 的 100.0）
+                    try {
+                        editor.putFloat(key, Float.parseFloat(val));
+                    } catch (NumberFormatException e) {
+                        editor.putString(key, val);
+                    }
+                } else {
+                    // 普通字符串（如 URI）
+                    editor.putString(key, val);
+                }
+                continue;
+            }
+
+            // 新版本：包含「键、类型、值」三列的情况
+            String type = row.get(1);
+            String val = row.get(2);
+            try {
+                if ("Boolean".equals(type)) editor.putBoolean(key, Boolean.parseBoolean(val));
+                else if ("Integer".equals(type)) editor.putInt(key, Integer.parseInt(val));
+                else if ("Float".equals(type)) editor.putFloat(key, Float.parseFloat(val));
+                else if ("Long".equals(type)) editor.putLong(key, Long.parseLong(val));
+                else editor.putString(key, val);
+            } catch (Exception e) {
+                Log.e("BackupManager", "Excel解析配置行失败", e);
+            }
+        }
+        editor.apply();
+        // 解析分类
+        for (List<String> row : categoryRows) {
+            if (row.size() < 2) continue;
+            String type = row.get(0);
+            String name = row.get(1);
+            if ("支出".equals(type)) {
+                if (!expenseCats.contains(name)) expenseCats.add(name);
+            } else if ("收入".equals(type)) {
+                if (!incomeCats.contains(name)) incomeCats.add(name);
+            }
+        }
+
+        // 解析二级分类
+        Map<String, List<String>> restoredSubMap = new HashMap<>();
+        for (List<String> row : subCategoryRows) {
+            if (row.size() < 2) continue;
+            String parent = row.get(0);
+            String subsStr = row.get(1);
+            if (!TextUtils.isEmpty(subsStr)) {
+                String[] subsArr = subsStr.split("\\|");
+                List<String> subList = new ArrayList<>();
+                for (String s : subsArr) {
+                    if (!TextUtils.isEmpty(s)) subList.add(s);
+                }
+                CategoryManager.saveSubCategories(context, parent, subList);
+                restoredSubMap.put(parent, subList);
+            }
+        }
+
+        // 解析助手配置
+        BackupData.AssistantConfigData restoredConfig = new BackupData.AssistantConfigData();
+        AssistantConfig currentConfig = new AssistantConfig(context);
+        // 初始化为当前值，防止文件缺少配置
+        restoredConfig.enableAutoTrack = currentConfig.isEnabled();
+//        restoredConfig.enableRefund = currentConfig.isRefundEnabled();
+        restoredConfig.enableAssets = currentConfig.isAssetsEnabled();
+        restoredConfig.defaultAssetId = currentConfig.getDefaultAssetId();
+        
+        for (List<String> row : assistantRows) {
+            if (row.size() < 2) continue;
+            String key = row.get(0);
+            String val = row.get(1);
+            try {
+                switch (key) {
+                    case "自动记账开关": restoredConfig.enableAutoTrack = Boolean.parseBoolean(val); break;
+                    case "退款监听": restoredConfig.enableRefund = Boolean.parseBoolean(val); break;
+                    case "资产模块": restoredConfig.enableAssets = Boolean.parseBoolean(val); break;
+                    case "默认资产ID": restoredConfig.defaultAssetId = Integer.parseInt(val); break;
+                    case "工作日加班倍率": restoredConfig.weekdayRate = Float.parseFloat(val); break;
+                    case "节假日加班倍率": restoredConfig.holidayRate = Float.parseFloat(val); break;
+                    case "月薪底薪": restoredConfig.monthlyBaseSalary = Float.parseFloat(val); break;
+                    case "支出关键字": restoredConfig.expenseKeywords = splitSet(val); break;
+                    case "收入关键字": restoredConfig.incomeKeywords = splitSet(val); break;
+                }
+            } catch (Exception e) {
+                Log.e("BackupManager", "解析配置行失败: " + key, e);
+            }
+        }
+        restoreAssistantConfig(context, restoredConfig);
+
+        // 解析自动资产规则
+        List<String> restoredRules = new ArrayList<>();
+        for (List<String> row : ruleRows) {
+            if (row.size() < 3) continue;
+            String pkg = row.get(0);
+            String kw = row.get(1);
+            try {
+                int id = Integer.parseInt(row.get(2));
+                AutoAssetManager.AssetRule rule = new AutoAssetManager.AssetRule(pkg, kw, id);
+                AutoAssetManager.addRule(context, rule);
+                restoredRules.add(rule.toString());
+            } catch (Exception e) {
+                Log.e("BackupManager", "解析规则行失败", e);
+            }
+        }
+
+        // 【新增】解析自动续费设置并存入
+        List<RenewalItem> restoredRenewals = new ArrayList<>();
+        for (List<String> row : renewalRows) {
+            if (row.size() < 1) continue;
+            try {
+                restoredRenewals.add(RenewalItem.fromJson(row.get(0)));
+            } catch (Exception e) {
+                // ignore
+            }
+        }
+        if (!restoredRenewals.isEmpty()) {
+            new AssistantConfig(context).saveRenewalList(restoredRenewals);
+        }
+
+        BackupData data = new BackupData(transactions, assets);
+        data.expenseCategories = expenseCats;
+        data.incomeCategories = incomeCats;
+        data.assistantConfig = restoredConfig;
+        data.autoAssetRules = restoredRules;
+        data.subCategoryMap = restoredSubMap;
+        return data;
+    }
+
+    // ============================================================================================
+    // 微信账单导入 (支持 .xlsx 和 .csv)
+    // ============================================================================================
+
+    // 辅助方法：模糊匹配当前应用内的一级/二级分类，若都未匹配到则新建一级分类
+    private static String[] matchOrCreateCategory(String rawCategory, int type, List<String> expCats, List<String> incCats, Map<String, List<String>> subCatMap) {
+        if (TextUtils.isEmpty(rawCategory) || "/".equals(rawCategory)) {
+            rawCategory = "其它";
+        }
+
+        List<String> targetList = (type == 1) ? incCats : expCats;
+
+        // 1. 模糊匹配一级分类
+        for (String cat : targetList) {
+            if (rawCategory.contains(cat) || cat.contains(rawCategory)) {
+                return new String[]{cat, ""};
+            }
+        }
+
+        // 2. 模糊匹配二级分类
+        for (String parentCat : targetList) {
+            List<String> subs = subCatMap.get(parentCat);
+            if (subs != null) {
+                for (String sub : subs) {
+                    if (rawCategory.contains(sub) || sub.contains(rawCategory)) {
+                        return new String[]{parentCat, sub};
+                    }
+                }
+            }
+        }
+
+        // 3. 都没有匹配到，新建并加入一级分类列表
+        if (!targetList.contains(rawCategory)) {
+            targetList.add(rawCategory);
+        }
+        return new String[]{rawCategory, ""};
+    }
+
+    public static BackupData importFromWeChat(Context context, Uri uri, List<AssetAccount> allAssets) throws Exception {
+        try {
+            return importWeChatAsExcel(context, uri, allAssets);
+        } catch (Exception e) {
+            return importWeChatAsCsv(context, uri, allAssets);
+        }
+    }
+
+    private static BackupData importWeChatAsExcel(Context context, Uri uri, List<AssetAccount> allAssets) throws Exception {
+        List<Transaction> transactions = new ArrayList<>();
+        List<AssetAccount> newAssetsToCreate = new ArrayList<>();
+        Map<String, Integer> newAssetMap = new HashMap<>();
+
+        // 获取并构建现有分类及子分类的数据结构
+        List<String> expCats = new ArrayList<>(CategoryManager.getExpenseCategories(context));
+        List<String> incCats = new ArrayList<>(CategoryManager.getIncomeCategories(context));
+        Map<String, List<String>> subCatMap = new HashMap<>();
+        for (String cat : expCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, cat);
+            if (subs != null && !subs.isEmpty()) subCatMap.put(cat, subs);
+        }
+        for (String cat : incCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, cat);
+            if (subs != null && !subs.isEmpty()) subCatMap.put(cat, subs);
+        }
+
+        int maxAssetId = 0;
+        if (allAssets != null) {
+            for (AssetAccount a : allAssets) {
+                if (a.id > maxAssetId) maxAssetId = a.id;
+            }
+        }
+
+        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
+             Workbook workbook = WorkbookFactory.create(inputStream)) {
+
+            Sheet sheet = workbook.getSheetAt(0);
+            boolean isDataSection = false;
+
+            for (Row row : sheet) {
+                if (row == null) continue;
+
+                String firstColText = getCellText(row.getCell(0));
+
+                if (firstColText.contains("交易时间")) {
+                    isDataSection = true;
+                    continue;
+                }
+
+                if (!isDataSection || row.getLastCellNum() < 7) continue;
+
+                String timeStr = getCellText(row.getCell(0));
+                if (TextUtils.isEmpty(timeStr) || !timeStr.contains("-")) continue;
+
+                Transaction t = new Transaction();
+                SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
+                try {
+                    Date date = sdf.parse(timeStr.trim());
+                    t.date = (date != null) ? date.getTime() : System.currentTimeMillis();
+                } catch (Exception e) {
+                    continue;
+                }
+                t.note = timeStr.trim();
+                t.remark = getCellText(row.getCell(2));
+
+                String typeStr = getCellText(row.getCell(4));
+                if ("收入".equals(typeStr)) {
+                    t.type = 1;
+                } else if ("支出".equals(typeStr)) {
+                    t.type = 0;
+                } else {
+                    t.type = 0;
+                }
+
+                String amountStr = getCellText(row.getCell(5)).replace("¥", "").replace(",", "").trim();
+                t.amount = parseDoubleSafe(amountStr);
+
+                String paymentMethod = getCellText(row.getCell(6)).trim();
+                int matchedId = matchAssetId(paymentMethod, allAssets);
+                if (matchedId == 0 && !TextUtils.isEmpty(paymentMethod) && !"/".equals(paymentMethod)) {
+                    if (newAssetMap.containsKey(paymentMethod)) {
+                        t.assetId = newAssetMap.get(paymentMethod);
+                    } else {
+                        maxAssetId++;
+                        int newId = maxAssetId;
+                        AssetAccount newAsset = new AssetAccount(paymentMethod, 0.0, 0);
+                        newAsset.id = newId;
+                        newAssetsToCreate.add(newAsset);
+                        newAssetMap.put(paymentMethod, newId);
+                        t.assetId = newId;
+                    }
+                } else {
+                    t.assetId = matchedId;
+                }
+
+                // 【修改】获取微信的交易类型(第2列, 索引1)并匹配
+                String rawCategory = getCellText(row.getCell(1)).trim();
+                String[] matchedCat = matchOrCreateCategory(rawCategory, t.type, expCats, incCats, subCatMap);
+                t.category = matchedCat[0];
+                t.subCategory = matchedCat[1];
+
+                transactions.add(t);
+            }
+        }
+        BackupData data = new BackupData(transactions, newAssetsToCreate);
+        data.expenseCategories = expCats;
+        data.incomeCategories = incCats;
+        return data;
+    }
+
+    // 辅助方法：安全获取 Excel 单元格内容
+    private static String getCellText(Cell cell) {
+        if (cell == null) return "";
+        switch (cell.getCellType()) {
+            case STRING:
+                return cell.getStringCellValue().trim();
+            case NUMERIC:
+                if (DateUtil.isCellDateFormatted(cell)) {
+                    return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(cell.getDateCellValue());
+                }
+                // 返回纯数字，避免科学计数法导致的解析问题
+                return String.valueOf(cell.getNumericCellValue());
+            case BOOLEAN:
+                return String.valueOf(cell.getBooleanCellValue());
+            default:
+                return "";
+        }
+    }
+
+    // 回退使用的原生 CSV 解析方法
+    private static BackupData importWeChatAsCsv(Context context, Uri uri, List<AssetAccount> allAssets) throws Exception {
+        List<Transaction> transactions = new ArrayList<>();
+        List<AssetAccount> newAssetsToCreate = new ArrayList<>();
+        Map<String, Integer> newAssetMap = new HashMap<>();
+
+        List<String> expCats = new ArrayList<>(CategoryManager.getExpenseCategories(context));
+        List<String> incCats = new ArrayList<>(CategoryManager.getIncomeCategories(context));
+        Map<String, List<String>> subCatMap = new HashMap<>();
+        for (String cat : expCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, cat);
+            if (subs != null && !subs.isEmpty()) subCatMap.put(cat, subs);
+        }
+        for (String cat : incCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, cat);
+            if (subs != null && !subs.isEmpty()) subCatMap.put(cat, subs);
+        }
+
+        int maxAssetId = 0;
+        if (allAssets != null) {
+            for (AssetAccount a : allAssets) {
+                if (a.id > maxAssetId) maxAssetId = a.id;
+            }
+        }
+
+        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
+             BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
+
+            String line;
+            boolean isDataSection = false;
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
+
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("\ufeff")) line = line.substring(1);
+                if (TextUtils.isEmpty(line.trim())) continue;
+
+                if (line.contains("交易时间") && line.contains("收/支") && line.contains("金额(元)")) {
+                    isDataSection = true;
+                    continue;
+                }
+
+                if (!isDataSection) continue;
+
+                List<String> tokens = parseCsvLine(line);
+                if (tokens.size() < 7) continue;
+
+                Transaction t = new Transaction();
+                String timeStr = tokens.get(0);
+                try {
+                    Date date = sdf.parse(timeStr);
+                    t.date = (date != null) ? date.getTime() : System.currentTimeMillis();
+                } catch (Exception e) {
+                    continue;
+                }
+
+                t.note = timeStr;
+                t.remark = tokens.get(2);
+
+                String typeStr = tokens.get(4);
+                if ("收入".equals(typeStr)) t.type = 1;
+                else t.type = 0;
+
+                String amountStr = tokens.get(5).replace("¥", "").replace(",", "").trim();
+                t.amount = parseDoubleSafe(amountStr);
+
+                String paymentMethod = tokens.get(6).trim();
+                int matchedId = matchAssetId(paymentMethod, allAssets);
+                if (matchedId == 0 && !TextUtils.isEmpty(paymentMethod) && !"/".equals(paymentMethod)) {
+                    if (newAssetMap.containsKey(paymentMethod)) {
+                        t.assetId = newAssetMap.get(paymentMethod);
+                    } else {
+                        maxAssetId++;
+                        int newId = maxAssetId;
+                        AssetAccount newAsset = new AssetAccount(paymentMethod, 0.0, 0);
+                        newAsset.id = newId;
+                        newAssetsToCreate.add(newAsset);
+                        newAssetMap.put(paymentMethod, newId);
+                        t.assetId = newId;
+                    }
+                } else {
+                    t.assetId = matchedId;
+                }
+
+                // 【修改】获取微信交易类型(通常在索引1)并匹配
+                String rawCategory = tokens.size() > 1 ? tokens.get(1).trim() : "其它";
+                String[] matchedCat = matchOrCreateCategory(rawCategory, t.type, expCats, incCats, subCatMap);
+                t.category = matchedCat[0];
+                t.subCategory = matchedCat[1];
+
+                transactions.add(t);
+            }
+        }
+        BackupData data = new BackupData(transactions, newAssetsToCreate);
+        data.expenseCategories = expCats;
+        data.incomeCategories = incCats;
+        return data;
+    }
+    // 辅助方法：通过支付方式文本匹配当前项目中的资产ID
+    private static int matchAssetId(String paymentMethod, List<AssetAccount> allAssets) {
+        if (TextUtils.isEmpty(paymentMethod) || "/".equals(paymentMethod)) {
+            return 0; // 无有效支付方式，不关联资产
+        }
+
+        if (allAssets != null) {
+            for (AssetAccount asset : allAssets) {
+                // 模糊匹配：例如微信的 "招商银行信用卡(1234)" 能够匹配上 app 里的 "招商银行" 或 "招商银行信用卡"
+                if (paymentMethod.contains(asset.name) || asset.name.contains(paymentMethod)) {
+                    return asset.id;
+                }
+            }
+        }
+        return 0; // 未匹配到任何现有资产，设为默认(0)
+    }
+
+    // ============================================================================================
+    // 支付宝账单导入 (支持 CSV, 动态列索引与双重编码尝试)
+    // ============================================================================================
+    public static BackupData importFromAlipay(Context context, Uri uri, List<AssetAccount> allAssets) throws Exception {
+        BackupData data = parseAlipayCsvWithEncoding(context, uri, "GBK", allAssets);
+        if (data.records.isEmpty()) {
+            data = parseAlipayCsvWithEncoding(context, uri, "UTF-8", allAssets);
+        }
+        return data;
+    }
+
+    private static BackupData parseAlipayCsvWithEncoding(Context context, Uri uri, String charsetName, List<AssetAccount> allAssets) throws Exception {
+        List<Transaction> transactions = new ArrayList<>();
+        List<AssetAccount> newAssetsToCreate = new ArrayList<>();
+        Map<String, Integer> newAssetMap = new HashMap<>();
+
+        List<String> expCats = new ArrayList<>(CategoryManager.getExpenseCategories(context));
+        List<String> incCats = new ArrayList<>(CategoryManager.getIncomeCategories(context));
+        Map<String, List<String>> subCatMap = new HashMap<>();
+        for (String cat : expCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, cat);
+            if (subs != null && !subs.isEmpty()) subCatMap.put(cat, subs);
+        }
+        for (String cat : incCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, cat);
+            if (subs != null && !subs.isEmpty()) subCatMap.put(cat, subs);
+        }
+
+        int maxAssetId = 0;
+        if (allAssets != null) {
+            for (AssetAccount a : allAssets) {
+                if (a.id > maxAssetId) maxAssetId = a.id;
+            }
+        }
+
+        try (InputStream inputStream = context.getContentResolver().openInputStream(uri);
+             BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, charsetName))) {
+
+            String line;
+            boolean isDataSection = false;
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
+
+            // 新增 tradeCatIdx 用于定位“交易分类”列
+            int timeIdx = -1, typeIdx = -1, amountIdx = -1, descIdx = -1, paymentIdx = -1, tradeCatIdx = -1;
+
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("\ufeff")) line = line.substring(1);
+                if (TextUtils.isEmpty(line.trim())) continue;
+
+                if (isDataSection && line.startsWith("---")) break;
+
+                if (!isDataSection && line.contains("交易时间") && line.contains("收/支") && line.contains("金额")) {
+                    isDataSection = true;
+                    List<String> headers = parseCsvLine(line);
+                    for (int i = 0; i < headers.size(); i++) {
+                        String h = headers.get(i).trim();
+                        if (h.contains("交易时间")) timeIdx = i;
+                        else if (h.contains("收/支")) typeIdx = i;
+                        else if (h.contains("金额")) amountIdx = i;
+                        else if (h.contains("商品说明") || h.contains("商品名称")) descIdx = i;
+                        else if (h.contains("收/付款方式")) paymentIdx = i;
+                        else if (h.contains("交易分类")) tradeCatIdx = i;
+                    }
+                    continue;
+                }
+
+                if (!isDataSection) continue;
+
+                List<String> tokens = parseCsvLine(line);
+                int maxRequiredIdx = Math.max(Math.max(timeIdx, typeIdx), Math.max(amountIdx, descIdx));
+                maxRequiredIdx = Math.max(maxRequiredIdx, paymentIdx);
+                maxRequiredIdx = Math.max(maxRequiredIdx, tradeCatIdx); // 把交易分类也算进下限检查
+
+                if (timeIdx == -1 || typeIdx == -1 || amountIdx == -1 || tokens.size() <= maxRequiredIdx) {
+                    continue;
+                }
+
+                Transaction t = new Transaction();
+                String timeStr = tokens.get(timeIdx).trim();
+                try {
+                    Date date = sdf.parse(timeStr);
+                    t.date = (date != null) ? date.getTime() : System.currentTimeMillis();
+                } catch (Exception e) {
+                    continue;
+                }
+
+                t.note = timeStr;
+                t.remark = (descIdx != -1) ? tokens.get(descIdx).trim() : "";
+
+                String typeStr = tokens.get(typeIdx).trim();
+                if ("收入".equals(typeStr)) {
+                    t.type = 1;
+                } else if ("支出".equals(typeStr)) {
+                    t.type = 0;
+                } else {
+                    t.type = 0;
+                }
+
+                String amountStr = tokens.get(amountIdx).replace("¥", "").replace(",", "").trim();
+                t.amount = parseDoubleSafe(amountStr);
+
+                String paymentMethod = (paymentIdx != -1) ? tokens.get(paymentIdx).trim() : "";
+                int matchedId = matchAssetId(paymentMethod, allAssets);
+
+                if (matchedId == 0 && !TextUtils.isEmpty(paymentMethod) && !"/".equals(paymentMethod)) {
+                    if (newAssetMap.containsKey(paymentMethod)) {
+                        t.assetId = newAssetMap.get(paymentMethod);
+                    } else {
+                        maxAssetId++;
+                        int newId = maxAssetId;
+                        AssetAccount newAsset = new AssetAccount(paymentMethod, 0.0, 0);
+                        newAsset.id = newId;
+                        newAssetsToCreate.add(newAsset);
+                        newAssetMap.put(paymentMethod, newId);
+                        t.assetId = newId;
+                    }
+                } else {
+                    t.assetId = matchedId;
+                }
+
+                // 【修改】获取支付宝交易分类进行匹配
+                String rawCategory = (tradeCatIdx != -1) ? tokens.get(tradeCatIdx).trim() : "其它";
+                String[] matchedCat = matchOrCreateCategory(rawCategory, t.type, expCats, incCats, subCatMap);
+                t.category = matchedCat[0];
+                t.subCategory = matchedCat[1];
+
+                transactions.add(t);
+            }
+        }
+        BackupData data = new BackupData(transactions, newAssetsToCreate);
+        data.expenseCategories = expCats;
+        data.incomeCategories = incCats;
+        return data;
+    }
+    // ... (rest of the helper methods: restoreAssistantConfig, joinSet, splitSet, parseCsvLine, parseDoubleSafe, escapeCsv remain unchanged) ...
+    private static void restoreAssistantConfig(Context context, BackupData.AssistantConfigData cd) {
+        if (cd == null) return;
+        AssistantConfig config = new AssistantConfig(context);
+        config.setEnabled(cd.enableAutoTrack);
+//        config.setRefundEnabled(cd.enableRefund);
+        config.setAssetsEnabled(cd.enableAssets);
+        config.setDefaultAssetId(cd.defaultAssetId);
+        config.setWeekdayOvertimeRate(cd.weekdayRate);
+        config.setHolidayOvertimeRate(cd.holidayRate);
+        config.setMonthlyBaseSalary(cd.monthlyBaseSalary);
+
+        if (cd.expenseKeywords != null) {
+            for (String k : cd.expenseKeywords) config.addExpenseKeyword(k);
+        }
+        if (cd.incomeKeywords != null) {
+            for (String k : cd.incomeKeywords) config.addIncomeKeyword(k);
+        }
+    }
+
+    private static String joinSet(Set<String> set) {
+        if (set == null || set.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (String s : set) {
+            if (sb.length() > 0) sb.append("|");
+            sb.append(s);
+        }
+        return sb.toString();
+    }
+
+    private static Set<String> splitSet(String val) {
+        Set<String> set = new HashSet<>();
+        if (TextUtils.isEmpty(val)) return set;
+        String[] parts = val.split("\\|");
+        for (String p : parts) {
+            if (!TextUtils.isEmpty(p)) set.add(p);
+        }
+        return set;
+    }
+
+    private static List<String> parseCsvLine(String line) {
+        List<String> tokens = new ArrayList<>();
+        StringBuilder sb = new StringBuilder();
+        boolean inQuotes = false;
+
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (c == '\"') {
+                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '\"') {
+                    sb.append('\"'); i++; 
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else if (c == ',' && !inQuotes) {
+                tokens.add(sb.toString()); sb.setLength(0);
+            } else {
+                sb.append(c);
+            }
+        }
+        tokens.add(sb.toString());
+        return tokens;
+    }
+
+    private static double parseDoubleSafe(String val) {
+        try { return Double.parseDouble(val); } catch (Exception e) { return 0.0; }
+    }
+    
+    private static String escapeCsv(String value) {
+        if (value == null) return "";
+        String result = value.replace("\"", "\"\""); 
+        if (result.contains(",") || result.contains("\n") || result.contains("\"")) {
+            return "\"" + result + "\"";
+        }
+        return result;
+    }
+
+    // ============================================================================================
+    // WebDAV 备份上传
+    // ============================================================================================
+    public static void uploadToWebDAV(Context context, String webdavUrl, String username, String password, List<Transaction> transactions, List<AssetAccount> assets, List<Goal> goals) throws Exception {
+        if (transactions == null) transactions = new ArrayList<>();
+        if (assets == null) assets = new ArrayList<>();
+        if (goals == null) goals = new ArrayList<>();
+        Gson gson = new Gson();
+        BackupData data = new BackupData(transactions, assets, goals);
+
+        List<String> expenseCats = CategoryManager.getExpenseCategories(context);
+        List<String> incomeCats = CategoryManager.getIncomeCategories(context);
+        data.expenseCategories = expenseCats;
+        data.incomeCategories = incomeCats;
+
+        Map<String, List<String>> subMap = new HashMap<>();
+        List<String> allCats = new ArrayList<>(expenseCats);
+        allCats.addAll(incomeCats);
+        for (String parent : allCats) {
+            List<String> subs = CategoryManager.getSubCategories(context, parent);
+            if (subs != null && !subs.isEmpty()) {
+                subMap.put(parent, subs);
+            }
+        }
+        data.subCategoryMap = subMap;
+
+        List<AutoAssetManager.AssetRule> rules = AutoAssetManager.getRules(context);
+        List<String> ruleStrings = new ArrayList<>();
+        for (AutoAssetManager.AssetRule rule : rules) {
+            ruleStrings.add(rule.toString());
+        }
+        data.autoAssetRules = ruleStrings;
+
+        AssistantConfig config = new AssistantConfig(context);
+        BackupData.AssistantConfigData configData = new BackupData.AssistantConfigData();
+        configData.enableAutoTrack = config.isEnabled();
+        configData.enableAssets = config.isAssetsEnabled();
+        configData.defaultAssetId = config.getDefaultAssetId();
+        configData.expenseKeywords = config.getExpenseKeywords();
+        configData.incomeKeywords = config.getIncomeKeywords();
+        configData.weekdayRate = config.getWeekdayOvertimeRate();
+        configData.holidayRate = config.getHolidayOvertimeRate();
+        configData.monthlyBaseSalary = config.getMonthlyBaseSalary();
+
+        data.assistantConfig = configData;
+        data.renewalList = config.getRenewalList();
+
+        SharedPreferences prefs = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE);
+        Map<String, BackupData.PrefItem> prefsMap = new HashMap<>();
+        for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
+            if (entry.getValue() != null) {
+                String type = entry.getValue().getClass().getSimpleName();
+                prefsMap.put(entry.getKey(), new BackupData.PrefItem(type, String.valueOf(entry.getValue())));
+            }
+        }
+        data.appPreferences = prefsMap;
+
+        String jsonString = gson.toJson(data);
+
+        // 1. 构建目录 URL 和 Basic 认证
+        String dirUrlStr = webdavUrl;
+        if (!dirUrlStr.endsWith("/")) dirUrlStr += "/";
+
+        String auth = username + ":" + password;
+        String encodedAuth = android.util.Base64.encodeToString(auth.getBytes(StandardCharsets.UTF_8), android.util.Base64.NO_WRAP);
+
+        // 2. [新增] 尝试自动创建目标文件夹 (MKCOL)
+        // 解决坚果云等网盘在目标文件夹不存在时直接 PUT 会报 404 / 409 的问题
+        try {
+            java.net.URL dirUrl = new java.net.URL(dirUrlStr);
+            java.net.HttpURLConnection dirConn = (java.net.HttpURLConnection) dirUrl.openConnection();
+            dirConn.setRequestMethod("MKCOL");
+            dirConn.setRequestProperty("Authorization", "Basic " + encodedAuth);
+            dirConn.setConnectTimeout(5000);
+            dirConn.setReadTimeout(5000);
+            dirConn.getResponseCode(); // 执行请求
+            dirConn.disconnect();
+        } catch (Exception e) {
+            // 忽略异常：如果目录已存在，服务器通常会报 405 Method Not Allowed，这属于正常情况
+        }
+
+        // 3. 构建文件的完整上传 URL
+        String fileUrlStr = dirUrlStr + "budget_backup.zip";
+        java.net.URL url = new java.net.URL(fileUrlStr);
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+
+        // 4. 配置 HTTP PUT 请求
+        conn.setDoOutput(true);
+        conn.setRequestMethod("PUT");
+        conn.setRequestProperty("Authorization", "Basic " + encodedAuth);
+        conn.setRequestProperty("Content-Type", "application/zip");
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(30000);
+
+        // 5. 将数据打包成 ZIP 流并直接写入网络连接
+        try (OutputStream out = conn.getOutputStream();
+             ZipOutputStream zos = new ZipOutputStream(out)) {
+            ZipEntry entry = new ZipEntry(JSON_FILE_NAME);
+            zos.putNextEntry(entry);
+            zos.write(jsonString.getBytes(StandardCharsets.UTF_8));
+            zos.closeEntry();
+        }
+
+        // 6. 检查服务器响应码，提供更精准的错误提示
+        int responseCode = conn.getResponseCode();
+        if (responseCode == 404 || responseCode == 409) {
+            throw new Exception("服务器返回 " + responseCode + "。请检查 WebDAV 地址是否拼写错误，或手动前往网盘新建该文件夹。");
+        } else if (responseCode == 401) {
+            throw new Exception("账号或密码(授权码)错误，服务器拒绝访问 (401)。");
+        } else if (responseCode < 200 || responseCode >= 300) {
+            throw new Exception("服务器返回错误状态码: " + responseCode + " - " + conn.getResponseMessage());
+        }
+    }
+
+    // ============================================================================================
+    // WebDAV 备份下载与同步
+    // ============================================================================================
+    public static BackupData downloadFromWebDAV(Context context, String webdavUrl, String username, String password) throws Exception {
+        String targetUrl = webdavUrl;
+        if (!targetUrl.endsWith("/")) targetUrl += "/";
+        targetUrl += "budget_backup.zip"; // 下载固定的备份文件名
+
+        java.net.URL url = new java.net.URL(targetUrl);
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+
+        // 1. 配置 HTTP GET 请求和 Basic 认证
+        conn.setRequestMethod("GET");
+        String auth = username + ":" + password;
+        String encodedAuth = android.util.Base64.encodeToString(auth.getBytes(StandardCharsets.UTF_8), android.util.Base64.NO_WRAP);
+        conn.setRequestProperty("Authorization", "Basic " + encodedAuth);
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(30000);
+
+        // 2. 检查服务器响应码
+        int responseCode = conn.getResponseCode();
+        if (responseCode == 404) {
+            throw new Exception("服务器上找不到备份文件，请先在其他设备上执行“上传数据”。");
+        } else if (responseCode < 200 || responseCode >= 300) {
+            throw new Exception("服务器返回错误状态码: " + responseCode + " - " + conn.getResponseMessage());
+        }
+
+        // 3. 将网络流转为 ZIP 流并解析内部的 JSON 文件
+        try (InputStream inputStream = conn.getInputStream();
+             ZipInputStream zis = new ZipInputStream(inputStream)) {
+
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (entry.getName().equals(JSON_FILE_NAME)) {
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(zis, StandardCharsets.UTF_8));
+                    StringBuilder sb = new StringBuilder();
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        sb.append(line);
+                    }
+                    Gson gson = new Gson();
+                    BackupData data = gson.fromJson(sb.toString(), BackupData.class);
+
+                    // --- 开始恢复应用配置 ---
+                    // 【新增】恢复一级支出分类
+                    if (data.expenseCategories != null && !data.expenseCategories.isEmpty()) {
+                        CategoryManager.saveExpenseCategories(context, data.expenseCategories);
+                    }
+
+                    // 【新增】恢复一级收入分类
+                    if (data.incomeCategories != null && !data.incomeCategories.isEmpty()) {
+                        CategoryManager.saveIncomeCategories(context, data.incomeCategories);
+                    }
+
+                    if (data.autoAssetRules != null && !data.autoAssetRules.isEmpty()) {
+                        for (String ruleStr : data.autoAssetRules) {
+                            AutoAssetManager.AssetRule rule = AutoAssetManager.AssetRule.fromString(ruleStr);
+                            if (rule != null) {
+                                AutoAssetManager.addRule(context, rule);
+                            }
+                        }
+                    }
+
+                    if (data.assistantConfig != null) {
+                        restoreAssistantConfig(context, data.assistantConfig);
+                    }
+
+                    if (data.subCategoryMap != null) {
+                        for (Map.Entry<String, List<String>> entryMap : data.subCategoryMap.entrySet()) {
+                            CategoryManager.saveSubCategories(context, entryMap.getKey(), entryMap.getValue());
+                        }
+                    }
+
+                    if (data.renewalList != null) {
+                        new AssistantConfig(context).saveRenewalList(data.renewalList);
+                    }
+
+                    if (data.appPreferences != null) {
+                        SharedPreferences.Editor editor = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE).edit();
+                        for (Map.Entry<String, BackupData.PrefItem> entryMap : data.appPreferences.entrySet()) {
+                            String key = entryMap.getKey();
+                            BackupData.PrefItem item = entryMap.getValue();
+                            if (item == null || item.value == null) continue;
+                            try {
+                                switch (item.type) {
+                                    case "Boolean": editor.putBoolean(key, Boolean.parseBoolean(item.value)); break;
+                                    case "Integer": editor.putInt(key, Integer.parseInt(item.value)); break;
+                                    case "Float": editor.putFloat(key, Float.parseFloat(item.value)); break;
+                                    case "Long": editor.putLong(key, Long.parseLong(item.value)); break;
+                                    default: editor.putString(key, item.value); break;
+                                }
+                            } catch (Exception e) {
+                                Log.e("BackupManager", "恢复配置异常", e);
+                            }
+                        }
+                        editor.apply();
+                    }
+                    return data; // 返回解析后的数据供数据库操作
+                }
+            }
+        }
+        throw new Exception("备份文件中未找到有效的数据。");
+    }
+
+    // ============================================================================================
+    // WebDAV 自动同步辅助方法
+    // ============================================================================================
+    
+    /**
+     * 触发 WebDAV 自动上传（如果已启用自动同步）
+     * 此方法会在后台线程执行，不会阻塞主线程
+     * 
+     * @param context 上下文
+     */
+    public static void triggerAutoUploadIfEnabled(Context context) {
+        SharedPreferences prefs = context.getSharedPreferences("webdav_prefs", Context.MODE_PRIVATE);
+        boolean autoSyncEnabled = prefs.getBoolean("webdav_auto_sync", false);
+        
+        if (!autoSyncEnabled) {
+            return; // 自动同步未启用，直接返回
+        }
+        
+        String url = prefs.getString("webdav_url", "");
+        String username = prefs.getString("webdav_username", "");
+        String password = prefs.getString("webdav_password", "");
+        
+        if (url.isEmpty() || username.isEmpty() || password.isEmpty()) {
+            return; // 配置不完整，直接返回
+        }
+        
+        // 在后台线程执行上传
+        new Thread(() -> {
+            try {
+                com.example.budgetapp.database.AppDatabase db = com.example.budgetapp.database.AppDatabase.getDatabase(context);
+                
+                // 获取需要备份的数据
+                List<com.example.budgetapp.database.Transaction> transactions = db.transactionDao().getAllTransactionsSync();
+                List<com.example.budgetapp.database.AssetAccount> assets = db.assetAccountDao().getAllAssetsSync();
+                List<com.example.budgetapp.database.Goal> goals = db.goalDao().getAllGoalsSync();
+                
+                // 执行上传
+                uploadToWebDAV(context, url, username, password, transactions, assets, goals);
+                
+                // 保存备份时间
+                prefs.edit()
+                        .putLong("webdav_last_backup_time", System.currentTimeMillis())
+                        .apply();
+                
+                Log.d("BackupManager", "WebDAV 自动上传成功");
+            } catch (Exception e) {
+                Log.e("BackupManager", "WebDAV 自动上传失败: " + e.getMessage(), e);
+                // 静默失败，不打扰用户
+            }
+        }).start();
+    }
+}
