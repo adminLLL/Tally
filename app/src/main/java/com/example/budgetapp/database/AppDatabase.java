@@ -10,7 +10,7 @@ import androidx.annotation.NonNull;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-@Database(entities = {Transaction.class, AssetAccount.class, Goal.class, RecurringRule.class}, version = 27, exportSchema = false)
+@Database(entities = {Transaction.class, AssetAccount.class, Goal.class, RecurringRule.class}, version = 28, exportSchema = true)
 public abstract class AppDatabase extends RoomDatabase {
 
     public abstract TransactionDao transactionDao();
@@ -229,6 +229,15 @@ public abstract class AppDatabase extends RoomDatabase {
         }
     };
 
+    // 【余额一致性】27 -> 28：给流水打上“写入时是否已同步资产余额”的标记。
+    // 老数据默认 0，删单时不做余额回补，与升级前行为一致（不引入新的偏差）。
+    static final Migration MIGRATION_27_28 = new Migration(27, 28) {
+        @Override
+        public void migrate(@NonNull SupportSQLiteDatabase database) {
+            database.execSQL("ALTER TABLE transactions ADD COLUMN assetSynced INTEGER NOT NULL DEFAULT 0");
+        }
+    };
+
     public static AppDatabase getDatabase(final Context context) {
         if (INSTANCE == null) {
             synchronized (AppDatabase.class) {
@@ -245,8 +254,10 @@ public abstract class AppDatabase extends RoomDatabase {
                                     MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
                                     MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
                                     MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
-                                    MIGRATION_26_27
+                                    MIGRATION_26_27, MIGRATION_27_28
                             )
+                            // 注意：1->2 的迁移在历史版本里就缺失，保留 destructive fallback 是为了让
+                            // 极老的库还能“清库启动”，而不是直接崩在打开数据库那一步。新增版本请补迁移。
                             .fallbackToDestructiveMigration()
                             .build();
                 }

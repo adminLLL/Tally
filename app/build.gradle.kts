@@ -14,6 +14,14 @@ android {
         versionName = "3.8.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // 【可维护性】导出 Room schema 到 app/schemas/，让每次数据库版本变更都有可审阅的 JSON 快照，
+        // 迁移测试（MigrationTestHelper）和“这次改了哪张表”的 diff 都依赖它。
+        javaCompileOptions {
+            annotationProcessorOptions {
+                arguments["room.schemaLocation"] = "$projectDir/schemas"
+            }
+        }
     }
 
     buildTypes {
@@ -42,9 +50,9 @@ dependencies {
     implementation("dev.rikka.shizuku:api:$shizukuVersion")
     implementation("dev.rikka.shizuku:provider:$shizukuVersion")
 
-    implementation("androidx.work:work-runtime:2.8.1")
-
-    // WorkManager (用于定期静默保活自愈检测)
+    // WorkManager (用于定期静默保活自愈检测 + 周期账单激活)
+    // 注意：这里只保留一个版本，重复声明 2.8.1 / 2.9.0 会让 Gradle 解析出不确定的版本，
+    // 也容易在不同构建里拿到不同的 worker 实现。
     implementation("androidx.work:work-runtime:2.9.0")
 
     // --- 默认生成的依赖 (不要删，如果报错就保留你原来的) ---

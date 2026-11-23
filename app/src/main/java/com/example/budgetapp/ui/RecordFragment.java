@@ -2046,6 +2046,10 @@ public class RecordFragment extends Fragment {
                     // 【新增】保存不计入预算的状态
                     t.excludeFromBudget = isExcludedFromBudget[0];
 
+                    // 【余额一致性】这条走的是“记账 + 同步资产余额”路径，标记为已同步，
+                    // 删除时才会按 LedgerMath 回补（批量导入等只写流水的记录保持 0）。
+                    t.assetSynced = 1;
+
                     // 使用事务保证账单和多资产同步更新
                     final int finalAssetId = selectedAssetId;
                     final String finalTargetObj = targetObj;

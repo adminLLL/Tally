@@ -33,6 +33,7 @@ import androidx.navigation.fragment.NavHostFragment;
 import androidx.navigation.ui.NavigationUI;
 
 import com.example.budgetapp.database.AssetAccount;
+import com.example.budgetapp.database.AppDatabase;
 import com.example.budgetapp.database.Transaction;
 import com.example.budgetapp.widget.TodaySummaryWidget;
 import com.google.android.accessibility.selecttospeak.SelectToSpeakService;
@@ -491,13 +492,15 @@ public class MainActivity extends AppCompatActivity {
         applyCustomBackground();
 
         // 【周期记账】检查并激活到期的周期账单
-        new Thread(() -> {
+        // 用统一的数据库线程池而不是裸 new Thread：激活内部要开事务、读写 Room，
+        // 走 AppDatabase.databaseWriteExecutor 才能和其他写操作串在同一个池里，避免无限制新建线程。
+        AppDatabase.databaseWriteExecutor.execute(() -> {
             try {
-                com.example.budgetapp.util.RecurringTransactionManager.activatePendingTransactions(this);
+                com.example.budgetapp.util.RecurringTransactionManager.activatePendingTransactions(getApplicationContext());
             } catch (Exception e) {
                 e.printStackTrace();
             }
-        }).start();
+        });
 
         // 动态控制"预算"菜单栏是否显示
         BottomNavigationView bottomNav = findViewById(R.id.bottom_nav);
